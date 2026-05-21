@@ -380,6 +380,8 @@ class FlowIntentAgent:
                 f"mean/final/sequence: expected intent_gt (B, intent_dim), got {intent_gt.shape}"
             )
             intent_vec = intent_gt  # (B, intent_dim)
+        if getattr(cfg.task, "slot_stopgrad_intent", False):
+            intent_vec = intent_vec.detach()
         intent_target = intent_vec.unsqueeze(1)  # (B, 1, D) ←→ act in flow_loss
 
         intent_loss, _ = self._intent_loss_fn(
