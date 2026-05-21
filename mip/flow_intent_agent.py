@@ -135,6 +135,7 @@ class FlowIntentAgent:
             self.slot_encoder_ema = deepcopy(self.slot_encoder).requires_grad_(False)
             self._slot_aux_loss_weight = getattr(config.task, "slot_aux_loss_weight", 1.0)
             self._slot_recon_loss_weight = getattr(config.task, "slot_recon_loss_weight", 0.0)
+            self._slot_stopgrad_intent = getattr(config.task, "slot_stopgrad_intent", False)
             self.intent_seq_encoder_ema = None
             self.cnn_intent_encoder_ema = None
             effective_intent_dim = _slot_dim
@@ -380,7 +381,7 @@ class FlowIntentAgent:
                 f"mean/final/sequence: expected intent_gt (B, intent_dim), got {intent_gt.shape}"
             )
             intent_vec = intent_gt  # (B, intent_dim)
-        if getattr(cfg.task, "slot_stopgrad_intent", False):
+        if getattr(self, "_slot_stopgrad_intent", False):
             intent_vec = intent_vec.detach()
         intent_target = intent_vec.unsqueeze(1)  # (B, 1, D) ←→ act in flow_loss
 

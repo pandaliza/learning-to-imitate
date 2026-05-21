@@ -17,7 +17,8 @@ export NUMBA_CACHE_DIR=/tmp
 export MPLCONFIGDIR=/tmp/matplotlib
 export XDG_RUNTIME_DIR=/tmp
 
-python examples/train_robomimic.py \
+python examples/train/train_robomimic.py \
+    --config-path /home/ldahiya/max_vla/much-ado-about-noising/examples/configs \
     task=lift_mh_image_slot_intent_v8_stopgrad \
     network=mlp_flow_intent \
     optimization.gradient_steps=300000 \
