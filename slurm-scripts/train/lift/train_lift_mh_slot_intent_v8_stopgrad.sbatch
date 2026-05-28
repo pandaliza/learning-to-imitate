@@ -24,7 +24,7 @@ python examples/train/train_robomimic.py \
     optimization.gradient_steps=300000 \
     optimization.batch_size=16 \
     optimization.loss_type=flow \
-    optimization.auto_resume=false \
+    optimization.auto_resume=true \
     log.eval_episodes=50 \
     log.eval_freq=20000 \
     log.save_freq=50000 \

@@ -48,6 +48,10 @@ def make_dataset(task_config, mode="train"):
         pad_after = task_config.act_steps - 1
         dataset_horizon = task_config.horizon
 
+    slot_image_key = getattr(task_config, "slot_image_key", "agentview_rgb")
+    slot_obj_state_key = getattr(task_config, "slot_obj_state_key", "ee_states")
+    slot_obj_state_dim = getattr(task_config, "slot_obj_state_dim", -1)
+
     return LiberoDataset(
         dataset_paths=dataset_paths,
         obs_keys=task_config.obs_keys,
@@ -62,6 +66,9 @@ def make_dataset(task_config, mode="train"):
         intent_keys=intent_keys,
         task_id_conditioning=task_id_conditioning,
         num_tasks=num_tasks,
+        slot_image_key=slot_image_key,
+        slot_obj_state_key=slot_obj_state_key,
+        slot_obj_state_dim=slot_obj_state_dim,
     )
 
 
@@ -80,8 +87,11 @@ class LiberoDataset(BaseDataset):
         obs_steps: Number of observation history steps.
         intent_conditioning: Whether to extract intent from future eef.
         intent_horizon: Number of future steps for intent computation.
-        intent_type: "mean" or "encoded_mean".
+        intent_type: "mean", "encoded_mean", or "slot".
         intent_keys: HDF5 obs keys used for intent (e.g. ["ee_states"]).
+        slot_image_key: image key to use for slot attention frames (intent_type="slot").
+        slot_obj_state_key: HDF5 obs key for slot aux supervision (intent_type="slot").
+        slot_obj_state_dim: expected dim of slot_obj_state_key; -1 = auto-infer.
     """
 
     def __init__(
@@ -99,6 +109,9 @@ class LiberoDataset(BaseDataset):
         intent_keys: list[str] | None = None,
         task_id_conditioning: bool = False,
         num_tasks: int = 1,
+        slot_image_key: str = "agentview_rgb",
+        slot_obj_state_key: str = "ee_states",
+        slot_obj_state_dim: int = -1,
     ):
         super().__init__()
         self.obs_keys = obs_keys
@@ -111,6 +124,9 @@ class LiberoDataset(BaseDataset):
         self.intent_keys = intent_keys or ["ee_states"]
         self.task_id_conditioning = task_id_conditioning
         self.num_tasks = num_tasks
+        self.slot_image_key = slot_image_key
+        self.slot_obj_state_key = slot_obj_state_key
+        self.slot_obj_state_dim = slot_obj_state_dim
         self.lowdim_keys = ["state"]
         self._state_key_dims = {}
 
@@ -183,6 +199,15 @@ class LiberoDataset(BaseDataset):
                         eef_parts.append(arr)
                     episode["eef"] = np.concatenate(eef_parts, axis=-1)
 
+                if self.intent_type == "slot":
+                    slot_obj = f[f"data/{demo_key}/obs/{self.slot_obj_state_key}"][()].astype(np.float32)
+                    if slot_obj.ndim == 1:
+                        slot_obj = slot_obj[:, None]
+                    if self.slot_obj_state_dim == -1:
+                        self.slot_obj_state_dim = int(slot_obj.shape[-1])
+                        logger.info(f"[LiberoDataset] Auto-inferred slot_obj_state_dim={self.slot_obj_state_dim} from '{self.slot_obj_state_key}'")
+                    episode["slot_obj_state"] = slot_obj
+
                 self.replay_buffer.add_episode(episode)
 
     def _get_normalizer(self):
@@ -195,6 +220,8 @@ class LiberoDataset(BaseDataset):
             norm["obs"][img_key] = EmptyNormalizer()
         if self.intent_conditioning:
             norm["eef"] = MinMaxNormalizer(self.replay_buffer["eef"][:])
+        if self.intent_type == "slot":
+            norm["slot_obj_state"] = MinMaxNormalizer(self.replay_buffer["slot_obj_state"][:])
         return norm
 
     def sample_to_data(self, sample):
@@ -210,7 +237,7 @@ class LiberoDataset(BaseDataset):
 
         data = {"obs": obs, "action": action}
 
-        if self.intent_conditioning:
+        if self.intent_conditioning and self.intent_type != "slot":
             eef = sample["eef"].astype(np.float32)
             eef_normed = self.normalizer["eef"].normalize(eef)
             future_eef = eef_normed[self.obs_steps : self.obs_steps + self.intent_horizon]
@@ -218,6 +245,16 @@ class LiberoDataset(BaseDataset):
                 data["intent"] = future_eef.astype(np.float32)  # (N, eef_dim)
             else:  # "mean"
                 data["intent"] = future_eef.mean(axis=0).astype(np.float32)  # (eef_dim,)
+
+        if self.intent_type == "slot":
+            # intent_frames: future image frames (K, C, H, W) float32 in [0, 1]
+            imgs = sample[self.slot_image_key]  # (horizon, C, H, W) uint8
+            future_imgs = imgs[self.obs_steps : self.obs_steps + self.intent_horizon]
+            data["intent_frames"] = future_imgs.astype(np.float32) / 255.0
+            # object_states: future obj state normalized (K, obj_state_dim)
+            slot_obj = sample["slot_obj_state"].astype(np.float32)
+            slot_obj_normed = self.normalizer["slot_obj_state"].normalize(slot_obj)
+            data["object_states"] = slot_obj_normed[self.obs_steps : self.obs_steps + self.intent_horizon]
 
         if self.task_id_conditioning:
             data["task_id"] = np.array(int(sample["task_id"][0]), dtype=np.int64)

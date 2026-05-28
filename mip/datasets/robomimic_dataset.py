@@ -120,6 +120,7 @@ def make_dataset(task_config, mode="train"):
                 intent_type=_intent_type,
                 slot_image_key=getattr(task_config, "slot_image_key", "agentview_image"),
                 slot_obj_state_dim=getattr(task_config, "slot_obj_state_dim", 10),
+                slot_obj_state_key=getattr(task_config, "slot_obj_state_key", "object"),
             )
         else:
             raise ValueError(f"Invalid observation type: {task_config.obs_type}")
@@ -449,6 +450,7 @@ class RobomimicImageDataset(BaseDataset):
         intent_type: str = "mean",
         slot_image_key: str = "agentview_image",
         slot_obj_state_dim: int = 10,
+        slot_obj_state_key: str = "object",
     ):
         super().__init__()
         self.rotation_transformer = RotationTransformer(
@@ -466,7 +468,7 @@ class RobomimicImageDataset(BaseDataset):
         }
         # For slot intent, inject the object state key so it loads into the replay buffer.
         # It is NOT in the YAML shape_meta (not exposed as obs), but present in the HDF5.
-        _slot_obj_state_key = "object"
+        _slot_obj_state_key = slot_obj_state_key
         if intent_type == "slot" and _slot_obj_state_key not in _shape_meta_real["obs"]:  # cnn_image does not need object state key
             if slot_obj_state_dim == -1:
                 # Auto-infer from HDF5 so the YAML can use -1 as a sentinel.
@@ -573,7 +575,7 @@ class RobomimicImageDataset(BaseDataset):
 
         # Slot attention attributes (only meaningful when intent_type == "slot")
         self.slot_image_key = slot_image_key
-        self.slot_obj_state_key = "object"
+        self.slot_obj_state_key = slot_obj_state_key
         self.slot_obj_state_dim = slot_obj_state_dim
         self.slot_obj_normalizer = None
         if intent_type == "slot":

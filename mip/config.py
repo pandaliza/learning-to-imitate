@@ -187,6 +187,7 @@ class TaskConfig:
     use_soft_selector: bool = False  # if True, use learned soft selector over K slots instead of mean-pool
     slot_use_layer2: bool = False  # if True, use ResNet18 layer2 (128ch, ~11×11) instead of layer3 (256ch, ~6×6)
     slot_stopgrad_intent: bool = False  # if True, detach intent_vec before interpolant so slot encoder trains only via aux/recon losses
+    slot_obj_state_key: str = "object"  # HDF5 obs key used for slot aux supervision (e.g. "object" for robomimic, "ee_states" for LIBERO)
 
 
 @dataclass

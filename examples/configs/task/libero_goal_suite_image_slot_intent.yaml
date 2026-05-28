@@ -1,0 +1,22 @@
+# @package task
+# LIBERO-Goal suite — image observations, slot-intent (all 10 tasks)
+defaults:
+  - libero_goal_suite_image
+  - _self_
+
+arch_variant: flow_intent
+intent_conditioning: true
+intent_type: "slot"
+intent_dim: 64        # must match slot_dim
+intent_horizon: 8
+
+num_slots: 4
+slot_dim: 64
+slot_iters: 3
+slot_aux_loss_weight: 1.0
+slot_recon_loss_weight: 1.0
+slot_obj_state_dim: 6        # ee_states is 6D in LIBERO HDF5
+slot_obj_state_key: "ee_states"  # LIBERO has no "object" key; use ee_states as aux supervision target
+slot_image_key: "agentview_rgb"  # LIBERO image key (not agentview_image)
+use_soft_selector: true
+slot_use_layer2: true

@@ -206,8 +206,21 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
         )
 
         if arch_variant == "flow_intent":
-            _intent_gt = batch["intent"].to(config.optimization.device)
-            info = agent.update(act, base_obs, delta_t, intent_gt=_intent_gt)
+            _intent_type = getattr(config.task, "intent_type", "mean")
+            if _intent_type == "slot":
+                _slot_batch = {
+                    "intent_frames": batch["intent_frames"].to(config.optimization.device),
+                    "object_states": batch["object_states"].to(config.optimization.device),
+                }
+                info = agent.update(act, base_obs, delta_t, slot_batch=_slot_batch)
+            elif _intent_type == "cnn_image":
+                _slot_batch = {
+                    "intent_frames": batch["intent_frames"].to(config.optimization.device),
+                }
+                info = agent.update(act, base_obs, delta_t, slot_batch=_slot_batch)
+            else:
+                _intent_gt = batch["intent"].to(config.optimization.device)
+                info = agent.update(act, base_obs, delta_t, intent_gt=_intent_gt)
             lr_scheduler.step()
             action_lr_scheduler.step()
         else:
