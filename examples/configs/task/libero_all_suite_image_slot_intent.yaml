@@ -1,0 +1,101 @@
+# @package task
+# LIBERO spatial + goal + object (30 tasks) — image obs, slot-intent.
+# Stage-1 of the Pi0.5 slot-intent plan: trains one broad intent flow map
+# (p(z|s)) over the full 30-task subset. See docs/pi05_slotintent_finetuning.md.
+defaults:
+  - libero_spatial_image
+  - _self_
+
+env_name: "libero_all"
+env_type: "image"
+
+# Slot-intent settings (mirror libero_goal_suite_image_slot_intent.yaml).
+arch_variant: flow_intent
+intent_conditioning: true
+intent_type: "slot"
+intent_dim: 64        # must match slot_dim
+intent_horizon: 8
+
+num_slots: 4
+slot_dim: 64
+slot_iters: 3
+slot_aux_loss_weight: 1.0
+slot_recon_loss_weight: 1.0
+slot_obj_state_dim: 6              # ee_states is 6D in LIBERO HDF5
+slot_obj_state_key: "ee_states"   # LIBERO has no "object" key; use ee_states as aux target
+slot_image_key: "agentview_rgb"   # LIBERO image key (not agentview_image)
+slot_stopgrad_intent: true        # v8_stopgrad: slot encoder trained only by aux/recon
+use_soft_selector: true
+slot_use_layer2: true
+
+dataset_path: null
+dataset_paths:
+  # libero_spatial (10)
+  - /home/ldahiya/LIBERO/libero/datasets/libero_spatial/pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_spatial/pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_spatial/pick_up_the_black_bowl_in_the_top_drawer_of_the_wooden_cabinet_and_place_it_on_the_plate_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_spatial/pick_up_the_black_bowl_next_to_the_cookie_box_and_place_it_on_the_plate_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_spatial/pick_up_the_black_bowl_next_to_the_plate_and_place_it_on_the_plate_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_spatial/pick_up_the_black_bowl_next_to_the_ramekin_and_place_it_on_the_plate_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_spatial/pick_up_the_black_bowl_on_the_cookie_box_and_place_it_on_the_plate_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_spatial/pick_up_the_black_bowl_on_the_ramekin_and_place_it_on_the_plate_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_spatial/pick_up_the_black_bowl_on_the_stove_and_place_it_on_the_plate_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_spatial/pick_up_the_black_bowl_on_the_wooden_cabinet_and_place_it_on_the_plate_demo.hdf5
+  # libero_goal (10)
+  - /home/ldahiya/LIBERO/libero/datasets/libero_goal/open_the_middle_drawer_of_the_cabinet_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_goal/open_the_top_drawer_and_put_the_bowl_inside_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_goal/push_the_plate_to_the_front_of_the_stove_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_goal/put_the_bowl_on_the_plate_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_goal/put_the_bowl_on_the_stove_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_goal/put_the_bowl_on_top_of_the_cabinet_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_goal/put_the_cream_cheese_in_the_bowl_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_goal/put_the_wine_bottle_on_the_rack_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_goal/put_the_wine_bottle_on_top_of_the_cabinet_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_goal/turn_on_the_stove_demo.hdf5
+  # libero_object (10)
+  - /home/ldahiya/LIBERO/libero/datasets/libero_object/pick_up_the_alphabet_soup_and_place_it_in_the_basket_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_object/pick_up_the_bbq_sauce_and_place_it_in_the_basket_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_object/pick_up_the_butter_and_place_it_in_the_basket_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_object/pick_up_the_chocolate_pudding_and_place_it_in_the_basket_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_object/pick_up_the_cream_cheese_and_place_it_in_the_basket_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_object/pick_up_the_ketchup_and_place_it_in_the_basket_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_object/pick_up_the_milk_and_place_it_in_the_basket_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_object/pick_up_the_orange_juice_and_place_it_in_the_basket_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_object/pick_up_the_salad_dressing_and_place_it_in_the_basket_demo.hdf5
+  - /home/ldahiya/LIBERO/libero/datasets/libero_object/pick_up_the_tomato_sauce_and_place_it_in_the_basket_demo.hdf5
+
+bddl_file: null
+bddl_files:
+  # libero_spatial (10)
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_spatial/pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_spatial/pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_spatial/pick_up_the_black_bowl_in_the_top_drawer_of_the_wooden_cabinet_and_place_it_on_the_plate.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_spatial/pick_up_the_black_bowl_next_to_the_cookie_box_and_place_it_on_the_plate.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_spatial/pick_up_the_black_bowl_next_to_the_plate_and_place_it_on_the_plate.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_spatial/pick_up_the_black_bowl_next_to_the_ramekin_and_place_it_on_the_plate.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_spatial/pick_up_the_black_bowl_on_the_cookie_box_and_place_it_on_the_plate.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_spatial/pick_up_the_black_bowl_on_the_ramekin_and_place_it_on_the_plate.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_spatial/pick_up_the_black_bowl_on_the_stove_and_place_it_on_the_plate.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_spatial/pick_up_the_black_bowl_on_the_wooden_cabinet_and_place_it_on_the_plate.bddl
+  # libero_goal (10)
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_goal/open_the_middle_drawer_of_the_cabinet.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_goal/open_the_top_drawer_and_put_the_bowl_inside.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_goal/push_the_plate_to_the_front_of_the_stove.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_goal/put_the_bowl_on_the_plate.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_goal/put_the_bowl_on_the_stove.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_goal/put_the_bowl_on_top_of_the_cabinet.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_goal/put_the_cream_cheese_in_the_bowl.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_goal/put_the_wine_bottle_on_the_rack.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_goal/put_the_wine_bottle_on_top_of_the_cabinet.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_goal/turn_on_the_stove.bddl
+  # libero_object (10)
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/pick_up_the_alphabet_soup_and_place_it_in_the_basket.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/pick_up_the_bbq_sauce_and_place_it_in_the_basket.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/pick_up_the_butter_and_place_it_in_the_basket.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/pick_up_the_chocolate_pudding_and_place_it_in_the_basket.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/pick_up_the_cream_cheese_and_place_it_in_the_basket.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/pick_up_the_ketchup_and_place_it_in_the_basket.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/pick_up_the_milk_and_place_it_in_the_basket.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/pick_up_the_orange_juice_and_place_it_in_the_basket.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/pick_up_the_salad_dressing_and_place_it_in_the_basket.bddl
+  - /home/ldahiya/LIBERO/libero/libero/bddl_files/libero_object/pick_up_the_tomato_sauce_and_place_it_in_the_basket.bddl

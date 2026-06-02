@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=libero-goal-img-slot
-#SBATCH --output=logs/libero_goal_suite_image_slot_intent_%j.out
-#SBATCH --error=logs/libero_goal_suite_image_slot_intent_%j.err
+#SBATCH --job-name=libero-all-img-slot
+#SBATCH --output=logs/libero_all_suite_image_slot_intent_%j.out
+#SBATCH --error=logs/libero_all_suite_image_slot_intent_%j.err
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=48G
+#SBATCH --mem=160G
 #SBATCH --requeue
 #SBATCH --time=48:00:00
 
@@ -18,25 +18,24 @@ export NUMBA_CACHE_DIR="$(mktemp -d /tmp/numba_${SLURM_JOB_ID:-manual}_XXXXXX)"
 export MPLCONFIGDIR="$(mktemp -d /tmp/mpl_${SLURM_JOB_ID:-manual}_XXXXXX)"
 export XDG_RUNTIME_DIR="$(mktemp -d /tmp/xdg_${SLURM_JOB_ID:-manual}_XXXXXX)"
 export MUJOCO_GL=egl
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 trap 'rm -rf "$NUMBA_CACHE_DIR" "$MPLCONFIGDIR" "$XDG_RUNTIME_DIR"' EXIT
 
 python examples/train/train_libero.py \
     --config-path /home/ldahiya/max_vla/much-ado-about-noising/examples/configs \
-    task=libero_goal_suite_image_slot_intent \
+    task=libero_all_suite_image_slot_intent \
     network=mlp_flow_intent \
     optimization.gradient_steps=1000000 \
-    optimization.batch_size=32 \
+    optimization.batch_size=64 \
     optimization.loss_type=flow \
     optimization.weight_decay=1e-4 \
     log.eval_episodes=10 \
     log.eval_freq=100000 \
     log.eval_nsteps=9 \
-    log.save_freq=10000 \
+    log.save_freq=20000 \
     log.project=libero-experiments \
-    log.group=libero-goal-suite-image \
+    log.group=libero-all-suite-image \
     log.exp_name=slot_intent \
-    log.log_dir="/data/user_data/ldahiya/libero-train/libero-goal-suite-image/slot_intent" \
+    log.log_dir="/data/user_data/ldahiya/libero-train/libero-all-suite-image/slot_intent" \
     task.num_envs=5 \
     optimization.auto_resume=false \
     log.save_video=false

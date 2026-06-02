@@ -172,9 +172,9 @@ Likely converges before 30k on 10 tasks; watch the loss curve and early-stop.
 - [x] `Observation.intent` field + `from_dict` (model.py)
 - [x] `intent_proj` + adaRMS injection (pi0.py)
 - [x] `intent_dim` config field + `get_freeze_filter_action_head_only()` (pi0_config.py)
-- [x] `LiberoDataset` slot support (`intent_frames` / `object_states`)
-- [x] `libero_goal_suite_image_slot_intent.yaml` + Stage-1 sbatch
-- [ ] spatial / object suite slot configs (train Stage 1 on all 30 tasks)
+- [x] `LiberoDataset` slot support (`intent_frames` / `object_states`) — verified shapes
+- [x] `libero_goal_suite_image_slot_intent.yaml` (per-suite, for debugging)
+- [x] `libero_all_suite_image_slot_intent.yaml` (30 tasks) + sbatch — composes + slot data path verified
 - [ ] run Stage 1; recover the trained intent flow map
 - [ ] MIP → LeRobot intent precompute script (flow-map, obs-only)
 - [ ] `pi05_libero_intent` + `pi05_libero_baseline` TrainConfigs
