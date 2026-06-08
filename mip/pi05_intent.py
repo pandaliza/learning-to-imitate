@@ -92,3 +92,79 @@ class IntentGenerator:
             np.arange(T)[:, None] + np.arange(-obs_steps + 1, 1)[None, :], 0, T - 1
         )  # (T, obs_steps)
         return per_step[idx]
+
+
+class CotrainIntentModule:
+    """Trainable slot-intent stack for *co-training* with Pi0.5's action head.
+
+    Wraps a MIP `FlowIntentAgent` (no reimplementation) and exposes:
+      - `intent_and_losses(intent_frames, object_states, obs, delta_t)`:
+            slot encoder(future frames) -> intent (kept ATTACHED so the Pi0.5 action
+            loss co-adapts the slot encoder) + the slot aux/recon + flow-matching
+            losses (the flow map learns p(z|s) for eval).
+      - `sample_intent(obs)`: flow-map intent from current obs (the deployable
+            generator, used at eval).
+      - `train_parameters()`: encoder + slot encoder + flow map params for the
+            co-train optimizer.
+
+    Mirrors the intent step of `FlowIntentAgent.update` (mip/flow_intent_agent.py),
+    minus MIP's own action decoder (Pi0.5 replaces it). Optionally warm-starts the
+    intent stack from a Stage-1 checkpoint. See docs/pi05_slotintent_finetuning.md.
+    """
+
+    def __init__(self, task_config_name, config_dir, device="cuda", warmstart_ckpt=None):
+        GlobalHydra.instance().clear()
+        with initialize_config_dir(version_base=None, config_dir=os.path.abspath(config_dir)):
+            cfg = compose(
+                config_name="main",
+                overrides=[f"task={task_config_name}", "network=mlp_flow_intent"],
+            )
+        cfg.optimization.device = device
+        cfg.task.obs_dim = cfg.network.emb_dim
+        self.cfg = cfg
+        self.device = device
+        self.intent_dim = int(cfg.task.intent_dim)
+        self.image_keys = list(cfg.task.image_obs_keys)
+        self.agent = FlowIntentAgent(cfg)
+        if warmstart_ckpt:
+            self.agent.load(warmstart_ckpt)  # ground the slot encoder / flow map from Stage 1
+        assert self.agent.slot_encoder is not None, "CotrainIntentModule requires intent_type=slot"
+        self._aux_w = self.agent._slot_aux_loss_weight
+        self._recon_w = self.agent._slot_recon_loss_weight
+
+    def intent_and_losses(self, intent_frames, object_states, obs, delta_t):
+        """Returns (intent (B, intent_dim) ATTACHED, {flow, aux[, recon]} losses)."""
+        ag = self.agent
+        use_recon = self._recon_w > 0 and ag.slot_encoder.recon_decoder is not None
+        if use_recon:
+            intent_vec, obj_pred, recon, recon_target = ag.slot_encoder(intent_frames, return_recon=True)
+            recon_loss = torch.nn.functional.mse_loss(recon, recon_target)
+        else:
+            intent_vec, obj_pred = ag.slot_encoder(intent_frames)
+            recon_loss = None
+        aux_loss = torch.nn.functional.mse_loss(obj_pred, object_states)
+        # Co-train: do NOT detach intent — the action loss flows back into the slot encoder.
+        intent_target = intent_vec.unsqueeze(1)  # (B, 1, D)
+        flow_loss, _ = ag._intent_loss_fn(
+            ag.config.optimization, ag.intent_flow_map, ag.encoder, ag.interpolant,
+            intent_target, obs, delta_t,
+        )
+        losses = {"flow": flow_loss, "aux": self._aux_w * aux_loss}
+        if recon_loss is not None:
+            losses["recon"] = self._recon_w * recon_loss
+        return intent_vec, losses
+
+    def sample_intent(self, obs, use_ema=False, num_steps=-1):
+        """Flow-map intent from current obs (eval-time p(z|s) generator)."""
+        return self.agent.sample_intent(obs, use_ema=use_ema, num_steps=num_steps)
+
+    def train_parameters(self):
+        params = list(self.agent.encoder.parameters()) + list(self.agent.intent_flow_map.parameters())
+        params += list(self.agent.slot_encoder.parameters())
+        return params
+
+    def train(self):
+        self.agent.encoder.train(); self.agent.intent_flow_map.train(); self.agent.slot_encoder.train()
+
+    def eval(self):
+        self.agent.encoder.eval(); self.agent.intent_flow_map.eval(); self.agent.slot_encoder.eval()
