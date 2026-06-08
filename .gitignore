@@ -221,3 +221,4 @@ rollouts-old/
 figs/
 plots/
 viz/
+.claude/scheduled_tasks.lock
