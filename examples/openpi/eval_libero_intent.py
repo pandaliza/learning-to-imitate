@@ -77,6 +77,9 @@ def main():
     ap.add_argument("--intent", action="store_true")
     ap.add_argument("--intent-task-config", default="libero_goal_suite_image_slot_intent")
     ap.add_argument("--intent-ckpt", default=None)
+    ap.add_argument("--norm-stats-from-config", action="store_true",
+                    help="load norm stats from the config's assets dir instead of checkpoint/assets "
+                         "(for PyTorch co-train checkpoints, which save model.safetensors without assets/)")
     ap.add_argument("--config-dir", default="examples/configs")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out", required=True)
@@ -89,7 +92,12 @@ def main():
 
     # ---- load policy ----
     train_config = _config.get_config(args.config_name)
-    policy = _policy_config.create_trained_policy(train_config, args.checkpoint_dir)
+    norm_stats = None
+    if args.norm_stats_from_config:
+        from openpi.training import checkpoints as _checkpoints
+        data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+        norm_stats = _checkpoints.load_norm_stats(train_config.assets_dirs, data_config.asset_id)
+    policy = _policy_config.create_trained_policy(train_config, args.checkpoint_dir, norm_stats=norm_stats)
 
     # ---- optional intent generator (MIP flow map sidecar) ----
     gen = None
