@@ -28,9 +28,9 @@ INTENT_RUN=/data/user_data/ldahiya/openpi-checkpoints/pi05_libero_intent/slot_in
 FLOW_MAP=/data/user_data/ldahiya/libero-train/libero-goal-suite-image/slot_intent/models/model_best.pt
 TRIALS=20
 
-# Latest *persistent* intent checkpoint step. Use a multiple of keep_period=5000 — the
-# bare latest step can be deleted mid-eval by the trainer's max_to_keep=1 policy.
-STEP=$(ls "$INTENT_RUN" 2>/dev/null | grep -E '^[0-9]+$' | awk '$1%5000==0' | sort -n | tail -1)
+# Intent run is COMPLETE -> use the true latest checkpoint (final 29999, persists).
+# (During training, prefer a multiple of keep_period=5000 to avoid the max_to_keep race.)
+STEP=$(ls "$INTENT_RUN" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1)
 echo "Using intent checkpoint step: ${STEP}"
 
 # 1. Baseline: off-the-shelf pi05_libero (PI convention -> rotate images, no intent).

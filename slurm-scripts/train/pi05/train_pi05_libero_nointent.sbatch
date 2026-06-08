@@ -16,7 +16,9 @@ source .venv/bin/activate
 export HF_LEROBOT_HOME=/data/user_data/ldahiya/lerobot
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
 export XLA_FLAGS="--xla_gpu_autotune_level=0"
-export JAX_COMPILATION_CACHE_DIR=/data/user_data/ldahiya/jax_cache
+# Separate cache dir from the intent run — sharing one dir across concurrent jobs
+# can lock/stall on compile-cache access.
+export JAX_COMPILATION_CACHE_DIR=/data/user_data/ldahiya/jax_cache_nointent
 export NUMBA_CACHE_DIR="$(mktemp -d /tmp/numba_${SLURM_JOB_ID:-manual}_XXXXXX)"
 export MPLCONFIGDIR="$(mktemp -d /tmp/mpl_${SLURM_JOB_ID:-manual}_XXXXXX)"
 export XDG_RUNTIME_DIR="$(mktemp -d /tmp/xdg_${SLURM_JOB_ID:-manual}_XXXXXX)"
