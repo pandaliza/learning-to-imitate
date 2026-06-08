@@ -182,6 +182,42 @@ Likely converges before 30k on 10 tasks; watch the loss curve and early-stop.
 
 ---
 
+## Co-trained variant (end-to-end) — implementation plan
+
+The decoupled approach above freezes the intent generator (precomputed intent). The
+**co-trained** variant trains the MIP slot encoder + flow map *jointly* with Pi0.5's
+action head, so the action loss co-adapts the intent. Decision (June 2026): do it on
+openpi's **PyTorch** Pi0.5 path so MIP's PyTorch `SlotObjectEncoder` + flow map are
+reused directly (no JAX reimplementation).
+
+Architecture (full MIP Config-A grafted onto Pi0.5's action expert):
+```
+TRAIN: future frames -> slot encoder -> intent_target  (aux + recon losses)
+       current obs    -> flow map ----> intent_sample   (flow-match to target)
+                                            -> Pi0.5 action expert (adaRMS) -> action loss
+       co-train: action loss flows into flow map / slot encoder (vs stopgrad decoupled)
+EVAL:  current obs -> flow map -> intent -> Pi0.5 action expert -> action
+```
+
+Build steps (increment status):
+- [x] **Model hook** — `intent_proj` + adaRMS injection in `pi0_pytorch.py`
+  (`embed_suffix`/`forward`/`denoise_step`/`sample_actions`), gated by `intent_dim>0`.
+- [ ] **Slot encoder + flow map in the loop** — import MIP `SlotObjectEncoder` + flow map
+  into `external/openpi/scripts/train_pytorch.py`'s step; produce intent each step.
+- [ ] **Future-frame dataloader** — serve `k` future image frames + `object_states`
+  per sample (the current LeRobot dataset stores precomputed intent, not future frames);
+  either extend the data pipeline to window future frames or add columns.
+- [ ] **Losses** — add aux (object-state regression) + recon + flow-matching terms to the
+  PyTorch training loss; `slot_stopgrad_intent` switch to toggle co-train vs decoupled.
+- [ ] **Eval** — flow map (now in-model) generates intent from current obs; reuse the
+  rollout harness with the PyTorch policy.
+- [ ] **Config + sbatch** — PyTorch `TrainConfig` + `train_pytorch.py` launch (torchrun,
+  gradient checkpointing on, BS16-32 per colleagues).
+
+Note: the slot encoder needs *future* frames so it runs at train only; the flow map is
+the eval-time `p(z|s)` generator (co-trained). This is the heaviest variant — sequence
+it after the decoupled-intent vs no-intent-control result lands (that motivates it).
+
 ## Open questions
 
 - Which LIBERO-10 task(s) for Stage 2 fine-tune + eval? (LIBERO-Long is the
