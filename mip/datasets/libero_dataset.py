@@ -4,6 +4,7 @@ Loads LIBERO HDF5 demonstration files into the MIP training pipeline.
 HDF5 layout mirrors robomimic: data/{demo_N}/actions, data/{demo_N}/obs/{key}.
 """
 
+import bisect
 import os
 
 import h5py
@@ -20,6 +21,37 @@ from mip.dataset_utils import (
     dict_apply,
 )
 from mip.datasets.base import BaseDataset
+
+
+class _LazyVLGrids:
+    """Disk-backed, episode-concatenated view over per-demo VL-grid .npy memmaps.
+
+    Injected into the ReplayBuffer under the "vl_grid" key so the SequenceSampler windows it
+    exactly like the pixel frames — but WITHOUT loading the full ~67GB cache into RAM. The
+    sampler only ever slices a contiguous range lying within a single episode, so each slice
+    maps to exactly one demo file (read from its memmap on demand)."""
+
+    def __init__(self, specs):  # specs: list of (npy_path, episode_length) in episode order
+        self._mm, self._starts, off = [], [], 0
+        shape1 = dtype = None
+        for path, n in specs:
+            m = np.load(path, mmap_mode="r")
+            assert m.shape[0] == n, f"VL grid {path}: len {m.shape[0]} != episode len {n}"
+            self._mm.append(m)
+            self._starts.append(off)
+            off += n
+            shape1, dtype = m.shape[1:], m.dtype
+        self._starts.append(off)
+        self.shape = (off,) + tuple(shape1)
+        self.dtype = dtype
+
+    def __len__(self):
+        return self.shape[0]
+
+    def __getitem__(self, sl):  # contiguous slice within ONE episode (sampler guarantee)
+        ep = bisect.bisect_right(self._starts, sl.start) - 1
+        base = self._starts[ep]
+        return np.asarray(self._mm[ep][sl.start - base : sl.stop - base])
 
 
 def make_dataset(task_config, mode="train"):
@@ -51,6 +83,8 @@ def make_dataset(task_config, mode="train"):
     slot_image_key = getattr(task_config, "slot_image_key", "agentview_rgb")
     slot_obj_state_key = getattr(task_config, "slot_obj_state_key", "ee_states")
     slot_obj_state_dim = getattr(task_config, "slot_obj_state_dim", -1)
+    vl_cache_dir = getattr(task_config, "vl_cache_dir", None)
+    wsm_w_cache_dir = getattr(task_config, "wsm_w_cache_dir", None)
 
     return LiberoDataset(
         dataset_paths=dataset_paths,
@@ -69,6 +103,8 @@ def make_dataset(task_config, mode="train"):
         slot_image_key=slot_image_key,
         slot_obj_state_key=slot_obj_state_key,
         slot_obj_state_dim=slot_obj_state_dim,
+        vl_cache_dir=vl_cache_dir,
+        wsm_w_cache_dir=wsm_w_cache_dir,
     )
 
 
@@ -112,6 +148,8 @@ class LiberoDataset(BaseDataset):
         slot_image_key: str = "agentview_rgb",
         slot_obj_state_key: str = "ee_states",
         slot_obj_state_dim: int = -1,
+        vl_cache_dir: str | None = None,
+        wsm_w_cache_dir: str | None = None,
     ):
         super().__init__()
         self.obs_keys = obs_keys
@@ -127,6 +165,10 @@ class LiberoDataset(BaseDataset):
         self.slot_image_key = slot_image_key
         self.slot_obj_state_key = slot_obj_state_key
         self.slot_obj_state_dim = slot_obj_state_dim
+        self.vl_cache_dir = vl_cache_dir
+        self.wsm_w_cache_dir = wsm_w_cache_dir
+        self._vl_specs = []  # (cache_path, episode_length) per demo, in load order
+        self._w_specs = []   # (w_npy_path, episode_length) per demo, for the wsm arm
         self.lowdim_keys = ["state"]
         self._state_key_dims = {}
 
@@ -140,6 +182,25 @@ class LiberoDataset(BaseDataset):
             f"Loaded {self.replay_buffer.n_episodes} episodes, "
             f"{self.replay_buffer.n_steps} total steps"
         )
+
+        # VL-grounded slot intent: inject the frozen-VL grid cache as a lazy, disk-backed
+        # "vl_grid" key BEFORE the sampler is built, so it is windowed exactly like the
+        # pixel frames without loading ~67GB into RAM (see _LazyVLGrids).
+        if self.vl_cache_dir:
+            lazy = _LazyVLGrids(self._vl_specs)
+            assert lazy.shape[0] == self.replay_buffer.n_steps, (
+                f"VL grid total {lazy.shape[0]} != buffer steps {self.replay_buffer.n_steps}")
+            self.replay_buffer.data["vl_grid"] = lazy
+            logger.info(f"[LiberoDataset] VL-grid cache: {len(self._vl_specs)} demos, grid {lazy.shape}")
+
+        # wsm arm: inject the per-demo frozen workspace latents w [T, dim] as a lazy "w" key so the
+        # sampler windows them with the frames (w_t = current frame, w_{t+1} = next frame in the window).
+        if self.wsm_w_cache_dir:
+            lazy_w = _LazyVLGrids(self._w_specs)
+            assert lazy_w.shape[0] == self.replay_buffer.n_steps, (
+                f"w cache total {lazy_w.shape[0]} != buffer steps {self.replay_buffer.n_steps}")
+            self.replay_buffer.data["w"] = lazy_w
+            logger.info(f"[LiberoDataset] w cache: {len(self._w_specs)} demos, w {lazy_w.shape}")
 
         self.sampler = SequenceSampler(
             replay_buffer=self.replay_buffer,
@@ -190,7 +251,7 @@ class LiberoDataset(BaseDataset):
                     imgs = np.ascontiguousarray(imgs.transpose(0, 3, 1, 2))  # (T, C, H, W)
                     episode[img_key] = imgs  # uint8
 
-                if self.intent_conditioning:
+                if self.intent_conditioning or self.wsm_w_cache_dir:  # wsm intent target also needs eef
                     eef_parts = []
                     for key in self.intent_keys:
                         arr = f[f"data/{demo_key}/obs/{key}"][()].astype(np.float32)
@@ -208,6 +269,16 @@ class LiberoDataset(BaseDataset):
                         logger.info(f"[LiberoDataset] Auto-inferred slot_obj_state_dim={self.slot_obj_state_dim} from '{self.slot_obj_state_key}'")
                     episode["slot_obj_state"] = slot_obj
 
+                if self.vl_cache_dir:
+                    stem = os.path.basename(path).replace("_demo.hdf5", "").replace(".hdf5", "")
+                    cache_path = os.path.join(self.vl_cache_dir, f"{stem}__{demo_key}.npy")
+                    self._vl_specs.append((cache_path, len(actions)))
+
+                if self.wsm_w_cache_dir:
+                    stem = os.path.basename(path).replace("_demo.hdf5", "").replace(".hdf5", "")
+                    self._w_specs.append(
+                        (os.path.join(self.wsm_w_cache_dir, f"{stem}__{demo_key}.npy"), len(actions)))
+
                 self.replay_buffer.add_episode(episode)
 
     def _get_normalizer(self):
@@ -218,7 +289,7 @@ class LiberoDataset(BaseDataset):
             # LIBERO images are already represented in the same [0, 1] range at
             # train and eval time, so keep the image path identity-normalized.
             norm["obs"][img_key] = EmptyNormalizer()
-        if self.intent_conditioning:
+        if self.intent_conditioning or self.wsm_w_cache_dir:
             norm["eef"] = MinMaxNormalizer(self.replay_buffer["eef"][:])
         if self.intent_type == "slot":
             norm["slot_obj_state"] = MinMaxNormalizer(self.replay_buffer["slot_obj_state"][:])
@@ -255,6 +326,26 @@ class LiberoDataset(BaseDataset):
             slot_obj = sample["slot_obj_state"].astype(np.float32)
             slot_obj_normed = self.normalizer["slot_obj_state"].normalize(slot_obj)
             data["object_states"] = slot_obj_normed[self.obs_steps : self.obs_steps + self.intent_horizon]
+            if self.vl_cache_dir:
+                # VL-grounded slot input: frozen-VL agentview grids for the future window
+                # (slot encoder z* input). intent_frames above stays as the pixel-recon target.
+                grid = sample["vl_grid"]  # (horizon, N, vl_dim) fp16, windowed by the sampler
+                data["intent_vl_grids"] = (
+                    grid[self.obs_steps : self.obs_steps + self.intent_horizon].astype(np.float32))
+                # current-obs VL mean (last obs frame) -> flow-map generator conditioning.
+                data["vl_obs_mean"] = grid[self.obs_steps - 1].astype(np.float32).mean(axis=0)  # (vl_dim,)
+
+        if self.wsm_w_cache_dir:
+            # Frozen causal workspace latents, windowed by the sampler. w_t = current obs frame
+            # (causal, past-only); w_{t+1} = next frame (the JEPA target). Different tensors.
+            w = sample["w"].astype(np.float32)                          # (horizon, w_dim)
+            cur = self.obs_steps - 1
+            data["wsm_w_t"] = w[cur]                                    # (w_dim,)
+            data["wsm_w_next"] = w[min(cur + 1, w.shape[0] - 1)]       # (w_dim,) clamp at episode end
+            # intent target: mean future EEF pose over the intent horizon (normalized, same as intent path)
+            eef_normed = self.normalizer["eef"].normalize(sample["eef"].astype(np.float32))
+            future_eef = eef_normed[self.obs_steps : self.obs_steps + self.intent_horizon]
+            data["wsm_intent_target"] = future_eef.mean(axis=0).astype(np.float32)  # (eef_dim,)
 
         if self.task_id_conditioning:
             data["task_id"] = np.array(int(sample["task_id"][0]), dtype=np.int64)
