@@ -1,0 +1,6 @@
+# @package task
+# Tier-1 ablation: 7 slot-attention iterations (baseline 3) — more competition rounds -> crisper binding?
+defaults:
+  - libero_goal_suite_image_slot_intent_vl
+  - _self_
+slot_iters: 7

@@ -12,6 +12,7 @@ See docs/pi05_slotintent_finetuning.md.
 """
 
 import os
+from copy import deepcopy
 
 import numpy as np
 import torch
@@ -112,7 +113,7 @@ class CotrainIntentModule:
     intent stack from a Stage-1 checkpoint. See docs/pi05_slotintent_finetuning.md.
     """
 
-    def __init__(self, task_config_name, config_dir, device="cuda", warmstart_ckpt=None):
+    def __init__(self, task_config_name, config_dir, device="cuda", warmstart_ckpt=None, vl_obs=False):
         GlobalHydra.instance().clear()
         with initialize_config_dir(version_base=None, config_dir=os.path.abspath(config_dir)):
             cfg = compose(
@@ -125,12 +126,18 @@ class CotrainIntentModule:
         self.device = device
         self.intent_dim = int(cfg.task.intent_dim)
         self.image_keys = list(cfg.task.image_obs_keys)
+        self._obs_steps = int(cfg.task.obs_steps)
         self.agent = FlowIntentAgent(cfg)
         if warmstart_ckpt:
             self.agent.load(warmstart_ckpt)  # ground the slot encoder / flow map from Stage 1
         assert self.agent.slot_encoder is not None, "CotrainIntentModule requires intent_type=slot"
         self._aux_w = self.agent._slot_aux_loss_weight
         self._recon_w = self.agent._slot_recon_loss_weight
+        # VL-obs mode (Phase 1): the flow map conditions on the LoRA-VL mean image-token
+        # feature instead of the ResNet18 obs encoder. vl_proj maps VL width -> emb_dim;
+        # the slot-encoder target z* is unchanged. LazyLinear infers the VL width on first call.
+        self.vl_obs = vl_obs
+        self.vl_proj = torch.nn.LazyLinear(int(cfg.network.emb_dim)).to(device) if vl_obs else None
 
     def intent_and_losses(self, intent_frames, object_states, obs, delta_t):
         """Returns (intent (B, intent_dim) ATTACHED, {flow, aux[, recon]} losses)."""
@@ -154,17 +161,75 @@ class CotrainIntentModule:
             losses["recon"] = self._recon_w * recon_loss
         return intent_vec, losses
 
+    def _vl_obs_emb(self, vl_mean):
+        """VL mean feature (B, vl_width) -> obs_emb (B, To, emb_dim) matching the shape
+        the intent flow map expects from the ResNet encoder (To frames). The single
+        current-obs VL feature is repeated across the To window."""
+        return self.vl_proj(vl_mean).unsqueeze(1).expand(-1, self._obs_steps, -1)
+
+    def vl_intent_and_losses(self, intent_frames, object_states, vl_mean, delta_t, intent_grids=None):
+        """VL-grounded variant of intent_and_losses: the flow map conditions on the VL mean
+        obs feature (vl_mean) instead of the ResNet18 encoder.
+
+        If intent_grids is given AND the slot encoder is VL-grounded (slot_vl_input=True), the
+        slot encoder reads the frozen-VL token grid for z* and reconstructs the pixel frames
+        (intent_frames) -> the fully-VL decoupled variant. Otherwise it reads the ResNet path on
+        intent_frames (the co-train Phase-1 path). Returns (z* ATTACHED, losses)."""
+        assert self.vl_obs, "vl_intent_and_losses requires vl_obs=True"
+        ag = self.agent
+        vl_slot = getattr(ag.slot_encoder, "vl_input", False) and intent_grids is not None
+        use_recon = self._recon_w > 0 and ag.slot_encoder.recon_decoder is not None
+        if use_recon:
+            if vl_slot:
+                intent_vec, obj_pred, recon, recon_target = ag.slot_encoder(
+                    intent_grids, return_recon=True, recon_frames=intent_frames)
+            else:
+                intent_vec, obj_pred, recon, recon_target = ag.slot_encoder(intent_frames, return_recon=True)
+            recon_loss = torch.nn.functional.mse_loss(recon, recon_target)
+        else:
+            intent_vec, obj_pred = ag.slot_encoder(intent_grids if vl_slot else intent_frames)
+            recon_loss = None
+        aux_loss = torch.nn.functional.mse_loss(obj_pred, object_states)
+        intent_target = intent_vec.unsqueeze(1)  # (B, 1, D)  z*
+        # Reuse the standard flow loss but pass vl as the "encoder": encoder(obs, None)
+        # -> _vl_obs_emb(vl_mean). obs carries vl_mean.
+        flow_loss, _ = ag._intent_loss_fn(
+            ag.config.optimization, ag.intent_flow_map, lambda x, _m: self._vl_obs_emb(x), ag.interpolant,
+            intent_target, vl_mean, delta_t,
+        )
+        losses = {"flow": flow_loss, "aux": self._aux_w * aux_loss}
+        if recon_loss is not None:
+            losses["recon"] = self._recon_w * recon_loss
+        return intent_vec, losses
+
+    def vl_sample_intent(self, vl_mean, use_ema=False, num_steps=-1):
+        """Sample the deployable intent z_hat from the flow map conditioned on vl_mean
+        (the eval-time p(z|s) path for the VL-obs variant). Caller controls grad."""
+        assert self.vl_obs, "vl_sample_intent requires vl_obs=True"
+        ag = self.agent
+        intent_flow = ag.intent_flow_map_ema if use_ema else ag.intent_flow_map
+        cfg = deepcopy(ag.config.optimization)
+        if num_steps >= 1:
+            cfg.num_steps = int(num_steps)
+        obs_emb = self._vl_obs_emb(vl_mean)
+        noise = torch.randn(vl_mean.shape[0], 1, self.intent_dim, device=vl_mean.device)
+        return ag._run_intent_ode(cfg, intent_flow, obs_emb, noise).squeeze(1)  # (B, intent_dim)
+
     def sample_intent(self, obs, use_ema=False, num_steps=-1):
         """Flow-map intent from current obs (eval-time p(z|s) generator)."""
         return self.agent.sample_intent(obs, use_ema=use_ema, num_steps=num_steps)
 
     def train_parameters(self):
-        params = list(self.agent.encoder.parameters()) + list(self.agent.intent_flow_map.parameters())
+        # VL mode trains vl_proj (not the unused ResNet encoder) + flow map + slot encoder.
+        obs_enc = self.vl_proj if self.vl_obs else self.agent.encoder
+        params = list(obs_enc.parameters()) + list(self.agent.intent_flow_map.parameters())
         params += list(self.agent.slot_encoder.parameters())
         return params
 
     def train(self):
-        self.agent.encoder.train(); self.agent.intent_flow_map.train(); self.agent.slot_encoder.train()
+        (self.vl_proj if self.vl_obs else self.agent.encoder).train()
+        self.agent.intent_flow_map.train(); self.agent.slot_encoder.train()
 
     def eval(self):
-        self.agent.encoder.eval(); self.agent.intent_flow_map.eval(); self.agent.slot_encoder.eval()
+        (self.vl_proj if self.vl_obs else self.agent.encoder).eval()
+        self.agent.intent_flow_map.eval(); self.agent.slot_encoder.eval()

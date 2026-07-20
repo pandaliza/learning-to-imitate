@@ -1,0 +1,7 @@
+# @package task
+# Tier-1 ablation: soft selector OFF (intent = plain mean over slots) — isolates whether the
+# collapse is the selector vs the slots themselves.
+defaults:
+  - libero_goal_suite_image_slot_intent_vl
+  - _self_
+use_soft_selector: false

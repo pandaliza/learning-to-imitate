@@ -1,0 +1,7 @@
+# @package task
+# Tier-1 ablation: 10x recon weight (baseline 1.0) — does stronger pixel reconstruction
+# force the slots to spatially decompose instead of collapsing to a uniform pool?
+defaults:
+  - libero_goal_suite_image_slot_intent_vl
+  - _self_
+slot_recon_loss_weight: 10.0

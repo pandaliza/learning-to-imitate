@@ -1,0 +1,9 @@
+# @package task
+# DINOv2-grounded slot intent: the slot encoder reads DINOv2 patch grids (256 x 768) instead of
+# PaliGemma VL grids. Otherwise identical to libero_goal_suite_image_slot_intent_vl.
+defaults:
+  - libero_goal_suite_image_slot_intent_vl
+  - _self_
+
+slot_vl_dim: 768   # DINOv2-base hidden dim
+vl_cache_dir: /data/group_data/maxlab/common_datasets/pandaliza/maxvla/openpi/vl_cache_goal_dinov2

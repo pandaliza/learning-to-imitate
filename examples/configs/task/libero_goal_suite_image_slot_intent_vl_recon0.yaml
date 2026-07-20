@@ -1,0 +1,6 @@
+# @package task
+# Tier-1 ablation: recon OFF (weight 0) — lower bracket; does recon matter at all for binding?
+defaults:
+  - libero_goal_suite_image_slot_intent_vl
+  - _self_
+slot_recon_loss_weight: 0.0

@@ -1,0 +1,8 @@
+# @package task
+# VL-grounded slot intent with K=8 slots (vs the default 4) — test whether more slots give
+# per-object binding + a non-uniform selector. Otherwise identical to the VL config.
+defaults:
+  - libero_goal_suite_image_slot_intent_vl
+  - _self_
+
+num_slots: 8

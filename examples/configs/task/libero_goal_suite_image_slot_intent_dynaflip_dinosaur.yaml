@@ -1,0 +1,8 @@
+# @package task
+# DINOSAUR on DynaFLIP features: slot encoder reads DynaFLIP grids (256x768) and reconstructs them
+# (feature recon, recon-dominant). Same recipe as the DINOv2 DINOSAUR arm, DynaFLIP features.
+defaults:
+  - libero_goal_suite_image_slot_intent_dynaflip
+  - _self_
+slot_feature_recon: true
+slot_recon_loss_weight: 10.0

@@ -1,0 +1,14 @@
+# @package task
+# LIBERO-Goal slot-intent, VL-GROUNDED + DECOUPLED.
+# Identical to libero_goal_suite_image_slot_intent, except the slot encoder reads the
+# frozen pi05_base VL agentview token grid (precomputed cache) instead of a ResNet18, and
+# the flow-map generator conditions on the current-obs VL mean. Trained decoupled (Stage-1),
+# then the action head is finetuned on the FROZEN intent (Stage-2 = the M1 mechanism).
+defaults:
+  - libero_goal_suite_image_slot_intent
+  - _self_
+
+slot_vl_input: true          # SlotObjectEncoder consumes the cached VL token grid (256, 2048)
+slot_vl_dim: 2048            # PaliGemma hidden width
+# Frozen pi05_base VL agentview grids (see examples/openpi/precompute_vl_grids.py).
+vl_cache_dir: /data/group_data/maxlab/common_datasets/pandaliza/maxvla/openpi/vl_cache_goal_agentview

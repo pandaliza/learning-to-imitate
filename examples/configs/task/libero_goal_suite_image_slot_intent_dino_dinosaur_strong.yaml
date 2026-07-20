@@ -1,0 +1,8 @@
+# @package task
+# DINOSAUR, recon-DOMINANT: 10x feature-recon weight so the (DINOv2) feature reconstruction --
+# not the generator's flow loss -- drives slot decomposition. Otherwise = the DINOSAUR arm.
+defaults:
+  - libero_goal_suite_image_slot_intent_dino_dinosaur
+  - _self_
+
+slot_recon_loss_weight: 10.0

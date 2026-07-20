@@ -1,0 +1,10 @@
+# @package task
+# DINOSAUR: reconstruct the DINOv2 FEATURE grid from the slots (instead of pixels) -- the proven
+# fix for slot-attention collapse on real scenes (Seitzer et al. 2023). Otherwise = the DINOv2 arm
+# (slot encoder reads DINOv2 256x768 grids). slot_recon_loss_weight (inherited, 1.0) drives the
+# feature reconstruction.
+defaults:
+  - libero_goal_suite_image_slot_intent_dino
+  - _self_
+
+slot_feature_recon: true

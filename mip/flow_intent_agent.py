@@ -123,6 +123,11 @@ class FlowIntentAgent:
             _use_recon = getattr(config.task, "slot_recon_loss_weight", 0.0) > 0
             _use_soft_selector = getattr(config.task, "use_soft_selector", False)
             _use_layer2 = getattr(config.task, "slot_use_layer2", False)
+            # VL-grounded slot input (decoupled variant): cached frozen-VL token grid replaces
+            # the ResNet18 backbone. slot_vl_dim = PaliGemma width (2048).
+            _vl_input = getattr(config.task, "slot_vl_input", False)
+            _vl_dim = getattr(config.task, "slot_vl_dim", 2048)
+            _feature_recon = getattr(config.task, "slot_feature_recon", False)  # DINOSAUR: recon features not pixels
             self.slot_encoder = SlotObjectEncoder(
                 num_slots=_num_slots,
                 slot_dim=_slot_dim,
@@ -131,6 +136,9 @@ class FlowIntentAgent:
                 use_recon_decoder=_use_recon,
                 use_soft_selector=_use_soft_selector,
                 use_layer2=_use_layer2,
+                vl_input=_vl_input,
+                vl_dim=_vl_dim,
+                feature_recon=_feature_recon,
             ).to(device)
             self.slot_encoder_ema = deepcopy(self.slot_encoder).requires_grad_(False)
             self._slot_aux_loss_weight = getattr(config.task, "slot_aux_loss_weight", 1.0)

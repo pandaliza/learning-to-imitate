@@ -1,0 +1,10 @@
+# @package task
+# DynaFLIP-grounded slot intent: the slot encoder reads DynaFLIP patch grids (256 x 768) instead
+# of PaliGemma VL grids. DynaFLIP is DINOv2 + a tri-modal-dynamics robotics adapter, so its patch
+# tokens are 768-D. Otherwise identical to libero_goal_suite_image_slot_intent_vl.
+defaults:
+  - libero_goal_suite_image_slot_intent_vl
+  - _self_
+
+slot_vl_dim: 768   # DynaFLIP patch-token dim (DINOv2-based)
+vl_cache_dir: /data/group_data/maxlab/common_datasets/pandaliza/maxvla/openpi/vl_cache_goal_dynaflip

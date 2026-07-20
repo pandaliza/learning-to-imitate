@@ -139,6 +139,36 @@ class SpatialBroadcastDecoder(nn.Module):
         return recon, masks
 
 
+class FeatureBroadcastDecoder(nn.Module):
+    """DINOSAUR-style feature decoder: reconstruct the N-position FEATURE grid from slots
+    (instead of pixels). Each slot is broadcast to all N positions, added to a learned
+    positional embedding, decoded by a shared MLP to (feature, alpha); features compete by
+    softmax-over-slots masks. Loss is MSE to the frozen input feature grid -- this makes slots
+    bind far better than pixel reconstruction on real scenes (Seitzer et al. 2023, DINOSAUR).
+    """
+
+    def __init__(self, slot_dim: int, feat_dim: int, num_pos: int = 256, hidden: int = 1024):
+        super().__init__()
+        self.pos = nn.Parameter(torch.randn(1, num_pos, slot_dim) * 0.02)
+        self.mlp = nn.Sequential(
+            nn.Linear(slot_dim, hidden), nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden), nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden), nn.ReLU(inplace=True),
+            nn.Linear(hidden, feat_dim + 1),  # per-position feature + alpha logit
+        )
+
+    def forward(self, slots: torch.Tensor):
+        """slots (B, K, slot_dim) -> recon (B, N, feat_dim), masks (B, K, N, 1)."""
+        B, K, Ds = slots.shape
+        N = self.pos.shape[1]
+        x = slots[:, :, None, :].expand(B, K, N, Ds) + self.pos[:, None, :, :]  # (B,K,N,Ds)
+        out = self.mlp(x)                                    # (B, K, N, feat_dim+1)
+        feat, alpha = out[..., :-1], out[..., -1:]
+        masks = alpha.softmax(dim=1)                         # slots compete per position
+        recon = (masks * feat).sum(dim=1)                    # (B, N, feat_dim)
+        return recon, masks
+
+
 class SlotObjectEncoder(nn.Module):
     """Encodes a stack of k image frames into an object-centric intent vector.
 
@@ -162,15 +192,28 @@ class SlotObjectEncoder(nn.Module):
         use_recon_decoder: bool = False,
         use_soft_selector: bool = False,
         use_layer2: bool = False,
+        vl_input: bool = False,
+        vl_dim: int = 2048,
+        feature_recon: bool = False,
+        vl_num_pos: int = 256,
     ):
         super().__init__()
-        resnet = models.resnet18(weights=None)
-        if use_layer2:
+        self.feature_recon = feature_recon
+        # VL-grounded variant: a cached frozen-VL token grid (N, vl_dim) replaces the ResNet18
+        # feature grid as the slot-attention input. Everything downstream (slot attention,
+        # selector, aux head, pixel-recon decoder) is identical to the ResNet path.
+        self.vl_input = vl_input
+        if vl_input:
+            self.cnn = None
+            self.proj = nn.Linear(vl_dim, slot_input_dim)
+        elif use_layer2:
+            resnet = models.resnet18(weights=None)
             # layer2 output: (B, 128, ~11, ~11) for 84×84 input — higher spatial resolution
             # for better object-level spatial competition between slots.
             self.cnn = nn.Sequential(*list(resnet.children())[:-4])
             self.proj = nn.Linear(128, slot_input_dim)
         else:
+            resnet = models.resnet18(weights=None)
             # layer3 output: (B, 256, ~6, ~6) for 84×84 input.
             self.cnn = nn.Sequential(*list(resnet.children())[:-3])
             self.proj = nn.Linear(256, slot_input_dim)
@@ -179,15 +222,25 @@ class SlotObjectEncoder(nn.Module):
         self.selector = nn.Linear(slot_dim, 1) if use_soft_selector else None
         # Auxiliary head: predicts object low-dim state from selected/mean slot vec
         self.obj_regressor = nn.Linear(slot_dim, obj_state_dim)
-        # Optional spatial broadcast decoder for reconstruction loss
-        self.recon_decoder = SpatialBroadcastDecoder(slot_dim) if use_recon_decoder else None
+        # Reconstruction decoder: DINOSAUR feature-recon (reconstruct the input VL grid) or the
+        # default pixel-recon spatial-broadcast decoder.
+        if not use_recon_decoder:
+            self.recon_decoder = None
+        elif feature_recon:
+            self.recon_decoder = FeatureBroadcastDecoder(slot_dim, vl_dim, num_pos=vl_num_pos)
+        else:
+            self.recon_decoder = SpatialBroadcastDecoder(slot_dim)
 
-    def forward(self, frames: torch.Tensor, return_attn: bool = False, return_recon: bool = False):
+    def forward(self, frames: torch.Tensor, return_attn: bool = False, return_recon: bool = False,
+                recon_frames: torch.Tensor = None):
         """
         Args:
-            frames:       (B, k, C, H, W) — normalized future image frames in [0, 1]
+            frames:       ResNet path -> (B, k, C, H, W) normalized frames in [0, 1];
+                          VL path (vl_input=True) -> (B, k, N, vl_dim) cached frozen-VL token grid.
             return_attn:  if True, also return (attn, spatial_shape)
             return_recon: if True and recon_decoder is present, also return (recon, frames_target)
+            recon_frames: VL path only -> (B, k, C, H, W) pixel frames as the pixel-recon TARGET
+                          (required when vl_input and return_recon; pixels aren't in the VL grid).
 
         Returns (always):
             intent:   (B, slot_dim)
@@ -198,13 +251,19 @@ class SlotObjectEncoder(nn.Module):
             recon:          (B*k, 3, H, W) reconstructed frames
             frames_target:  (B*k, C, H, W) input frames (reconstruction target)
         """
-        B, k, C, H, W = frames.shape
-        x = frames.reshape(B * k, C, H, W)
-
-        feat = self.cnn(x)                        # (B*k, 256, H', W')
-        Hp, Wp = feat.shape[2], feat.shape[3]
-        feat = feat.flatten(2).permute(0, 2, 1)   # (B*k, N, 256)
-        feat = self.proj(feat)                     # (B*k, N, slot_input_dim)
+        if self.vl_input:
+            B, k, N, D = frames.shape
+            feat = self.proj(frames.reshape(B * k, N, D))   # (B*k, N, slot_input_dim)
+            Hp, Wp = N, 1
+            pix = recon_frames                               # pixel-recon target source
+        else:
+            B, k, C, H, W = frames.shape
+            pix = frames
+            x = frames.reshape(B * k, C, H, W)
+            feat = self.cnn(x)                        # (B*k, 256, H', W')
+            Hp, Wp = feat.shape[2], feat.shape[3]
+            feat = feat.flatten(2).permute(0, 2, 1)   # (B*k, N, 256)
+            feat = self.proj(feat)                     # (B*k, N, slot_input_dim)
 
         if return_attn:
             slots, attn = self.slot_attention(feat, return_attn=True)  # (B*k, K, slot_dim), (B*k, K, N)
@@ -212,10 +271,17 @@ class SlotObjectEncoder(nn.Module):
             slots = self.slot_attention(feat)      # (B*k, K, slot_dim)
             attn = None
 
-        # Reconstruction from per-frame slots before mean pooling
-        recon = None
+        # Reconstruction from per-frame slots.
+        recon = recon_target = None
         if return_recon and self.recon_decoder is not None:
-            recon, _ = self.recon_decoder(slots, H, W)  # (B*k, 3, H, W)
+            if self.feature_recon:  # DINOSAUR: reconstruct the (frozen) input VL FEATURE grid
+                assert self.vl_input, "feature_recon requires vl_input (a feature grid to reconstruct)"
+                recon_target = frames.reshape(B * k, N, D).detach()  # (B*k, N, vl_dim), frozen target
+                recon, _ = self.recon_decoder(slots)                 # (B*k, N, vl_dim)
+            else:                   # pixel reconstruction (ResNet & VL paths)
+                assert pix is not None, "VL slot encoder needs recon_frames for the pixel-recon target"
+                recon_target = pix.reshape(pix.shape[0] * pix.shape[1], *pix.shape[2:])  # (B*k, C, H, W)
+                recon, _ = self.recon_decoder(slots, recon_target.shape[2], recon_target.shape[3])
 
         if self.selector is not None:
             scores = self.selector(slots)           # (B*k, K, 1)
@@ -231,5 +297,5 @@ class SlotObjectEncoder(nn.Module):
         if return_attn:
             out += [attn, (Hp, Wp)]
         if return_recon and recon is not None:
-            out += [recon, x]  # x = (B*k, C, H, W) reconstruction target
+            out += [recon, recon_target]  # (B*k, C, H, W) pixel reconstruction target
         return tuple(out) if len(out) > 2 else (intent, obj_pred)
