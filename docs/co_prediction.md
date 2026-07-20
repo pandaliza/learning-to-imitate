@@ -35,14 +35,15 @@ Dimensions (current LIBERO pi0.5 config):
 - `d_A`: action dim as configured now (openpi pads to 32; 7 supervised dims for LIBERO). Unchanged.
 - `d_I = 6`: absolute EEF pose per waypoint, **same parameterization as M9's targets** (the `eef` field
   the dataset already loads and normalizes; M9's 48-D concat = 8 × 6).
-- `H = 16`: action horizon (current expert suffix length).
+- `H = 10`: action horizon (all pi0.5 LIBERO configs use `action_horizon=10`; note MIP's chunk is 16
+  but the pi0.5 expert predicts 10 — the train scripts slice `act[:, :10]`).
 - `h = 8`: intent waypoints.
 
 **Intent supervision.** Exactly the M9 path — targets extracted from the LIBERO hdf5 demos via
 `steer_intent/intent_flow_dataset.py` (`wsm_intent_target`, `eef`-normalizer normalization, no
 teacher/rollout machinery, no `w` cache) — with one change: a **lookahead stride Δ**.
-`I_k = eef(t + k·Δ)` for `k = 1..8`, with `Δ = ceil(1.5·H/8) = 3`, so the intent horizon reaches
-`t+24`, *past* the H=16 action chunk. M9's current targets (`k = 1..8` contiguous, inside the chunk)
+`I_k = eef(t + k·Δ)` for `k = 1..8`, with `Δ = ceil(1.5·H/8) = 2`, so the intent horizon reaches
+`t+16`, *past* the H=10 action chunk. M9's current targets (`k = 1..8` contiguous, inside the chunk)
 are exactly the redundant regime this spec warns about (§9): intent ≈ subsampled cumsum(actions).
 The lookahead beyond the chunk is where intent carries non-redundant information (where the policy is
 *going*, not just what it does next). Implementation: a stride parameter on the future-slice in
@@ -66,7 +67,7 @@ v0.1 specced a fresh 6-block DiT replacing a 3-layer MLP head. That maps wrong o
 pretrained expert and the pi0.5 checkpoint init. Instead, extend the existing expert's suffix:
 
 ```
-suffix = [ I_1 … I_8 | A_1 … A_H ]        # 8 + 16 = 24 tokens (was 16)
+suffix = [ I_1 … I_8 | A_1 … A_H ]        # 8 + 10 = 18 tokens (was 10)
 ```
 
 - Intent tokens: new `intent_in_proj: Linear(d_I, width)` and `intent_out_proj: Linear(width, d_I)`,
@@ -86,7 +87,7 @@ vector per batch `(B, width)`, broadcast over the sequence. Required change:
 ```
 c_I = time_mlp(sinusoidal(τ_I))          # existing time_mlp_in/out, shared for both blocks
 c_A = time_mlp(sinusoidal(τ_A))
-adarms_cond = [c_I × 8 tokens | c_A × H tokens]   # (B, 24, width)
+adarms_cond = [c_I × 8 tokens | c_A × H tokens]   # (B, 18, width)
 ```
 
 Plumbing: in `RMSNorm.forward`, only `unsqueeze(1)` the modulation when `cond` is 2-D — a 3-D
@@ -158,7 +159,7 @@ being tested. (The per-token adaRMS plumbing from §2.3 already supports it when
 ## 4. Inference schedules
 
 All schedules cache prefix KV once (existing `sample_actions` structure); each denoising step is one
-expert forward over the 24-token suffix.
+expert forward over the 18-token suffix.
 
 ### S1 — Intent-first (the method)
 
@@ -198,7 +199,7 @@ Everything not listed is the M9 recipe verbatim (same sbatch skeleton, same data
 | Item | Setting |
 |---|---|
 | Backbone | PaliGemma, fine-tuned as in M8/M9 (unchanged) |
-| Expert | Existing Gemma-300M expert, full fine-tune (no fresh DiT); suffix 16 → 24 tokens |
+| Expert | Existing Gemma-300M expert, full fine-tune (no fresh DiT); suffix 10 → 18 tokens |
 | Init | Full pi0.5 base checkpoint (same convert as prior arms); fresh params = 2 intent projections, `intent_out_proj` zero-init |
 | Optimizer | M9 settings unchanged |
 | Batch / steps | M9 recipe; eval at 4k/8k/12k like prior arms (12k was both arms' best) |
@@ -255,7 +256,7 @@ arms showed non-uniform shifts). Compare against A0 = 79.0% and A0b once it exis
 numbers only; never against JAX M0 = 96.5%.
 
 **Intent quality.** ADE/FDE of predicted intent vs (a) realized policy EEF trajectory over the next
-24 steps, (b) demo trajectory from the nearest matching state. Divergence between the two indicates
+16 steps, (b) demo trajectory from the nearest matching state. Divergence between the two indicates
 plan-execution mismatch. Free to log during rollouts — the eval loop already has sim EEF state.
 
 **Mode commitment.** For fixed observation, sample N=16 generations; cluster action chunks (e.g. on
@@ -278,7 +279,7 @@ the originals and would pick up edits on resume), one sbatch per arm with env-va
 |---|---|
 | `external/openpi/.../models_pytorch/pi0_pytorch.py` | intent tokens in `embed_suffix` (+ the two projections, mask patterns J/T), per-block τ in `forward`, schedules S1/S2/S3 in `sample_actions` — all behind a config flag (e.g. `copred_h > 0`) so every existing path is untouched |
 | `external/openpi/.../transformers_replace/.../modeling_gemma.py` | per-token adaRMS: skip the `unsqueeze` when `cond` is 3-D (backward compatible) |
-| `steer_intent/intent_flow_dataset.py` | lookahead stride Δ on the future slice (param, default 1 = current M9 behavior) |
+| `steer_intent/intent_flow_dataset.py` | lookahead stride Δ=2 on the future slice (param, default 1 = current M9 behavior) |
 | `steer_intent/copred.py` | noise sampler (independent + stratified §3.1), per-block loss, schedule helpers |
 | `examples/openpi/train_pi05_m10.py` | fork of `train_pi05_m9.py` per fork convention |
 | `examples/openpi/eval_libero_intent.py` | `--schedule {s1,s2,s3}` flag (standard path untouched → A0/A0b evals unchanged) |
@@ -314,5 +315,5 @@ the pipeline. Single seed, 200 trials/point: the M9-vs-M8 6pp gap was not error-
 gap won't be either unless it's large. And **archive the best checkpoints immediately** — the trainer
 keeps last 3, which is how M9's 79% weights were lost.
 
-**Compute.** Suffix grows 16 → 24 tokens on a 300M expert — negligible vs the backbone. bs=32 +
+**Compute.** Suffix grows 10 → 18 tokens on a 300M expert — negligible vs the backbone. bs=32 +
 expandable_segments as per the slot-intent OOM note if memory gets tight.
