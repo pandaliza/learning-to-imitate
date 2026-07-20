@@ -1,0 +1,12 @@
+{
+  "open_the_middle_drawer_of_the_cabinet": ["cabinet", "middle drawer"],
+  "open_the_top_drawer_and_put_the_bowl_inside": ["cabinet", "top drawer", "bowl"],
+  "push_the_plate_to_the_front_of_the_stove": ["plate", "stove"],
+  "put_the_bowl_on_the_plate": ["bowl", "plate"],
+  "put_the_bowl_on_the_stove": ["bowl", "stove"],
+  "put_the_bowl_on_top_of_the_cabinet": ["bowl", "cabinet"],
+  "put_the_cream_cheese_in_the_bowl": ["cream cheese", "bowl"],
+  "put_the_wine_bottle_on_the_rack": ["wine bottle", "rack"],
+  "put_the_wine_bottle_on_top_of_the_cabinet": ["wine bottle", "cabinet"],
+  "turn_on_the_stove": ["stove", "stove knob"]
+}
