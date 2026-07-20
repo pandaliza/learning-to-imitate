@@ -222,3 +222,21 @@ figs/
 plots/
 viz/
 .claude/scheduled_tasks.lock
+.venv-label/
+
+# Scratch dir for smoke logs / one-off chain scripts (see docs/steer_intent_experiments.md).
+.venv-label-artifacts/
+
+# Sarvesh's WSM lab-handoff bundle: a received deliverable (+ its .tgz), not our source.
+# The model code we actually use was ported into steer_intent/.
+export/
+export.zip
+
+# Nested upstream checkout with its own .git -- committing it would create a phantom
+# submodule. Clone separately (or promote to a real submodule) rather than tracking here.
+external/DynaFLIP/
+
+# Figures are mostly multi-MB slot-attention renders; keep the small result plots only.
+figures/*
+!figures/sr_m8.png
+!figures/sr_m9.png
