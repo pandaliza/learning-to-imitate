@@ -18,9 +18,14 @@ export XDG_RUNTIME_DIR="$(mktemp -d /tmp/xdg_${SLURM_JOB_ID:-m}_XXXXXX)"
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.5
 trap 'rm -rf "$NUMBA_CACHE_DIR" "$MPLCONFIGDIR" "$XDG_RUNTIME_DIR"' EXIT
 
-# Convert pi05_libero (JAX/orbax) -> PyTorch safetensors for the co-train PyTorch path.
-# config_name=pi05_libero -> output has no intent_proj; co-train loads strict=False.
+# Convert a Pi0.5 JAX/orbax checkpoint -> PyTorch safetensors for the co-train PyTorch path.
+# Parameterized (override via: sbatch --export=ALL,CKPT=...,CONFIG=...,OUT=...). config_name
+# picks a non-LoRA/non-intent architecture (e.g. pi05_libero) compatible with the base weights;
+# the co-train loads it strict=False so LoRA/intent_proj are backfilled fresh.
+CKPT=${CKPT:-/data/group_data/maxlab/common_datasets/pandaliza/maxvla/openpi/pi05_base}
+CONFIG=${CONFIG:-pi05_libero}
+OUT=${OUT:-/data/group_data/maxlab/common_datasets/pandaliza/maxvla/openpi/pi05_base_pytorch}
 python external/openpi/examples/convert_jax_model_to_pytorch.py \
-    --checkpoint_dir /data/group_data/maxlab/common_datasets/pandaliza/maxvla/openpi/pi05_libero \
-    --config_name pi05_libero \
-    --output_path /data/user_data/ldahiya/pi05_libero_pytorch
+    --checkpoint_dir "$CKPT" \
+    --config_name "$CONFIG" \
+    --output_path "$OUT"

@@ -80,7 +80,26 @@ def main():
     ap.add_argument("--norm-stats-from-config", action="store_true",
                     help="load norm stats from the config's assets dir instead of checkpoint/assets "
                          "(for PyTorch co-train checkpoints, which save model.safetensors without assets/)")
+    # VL co-train eval: intent comes from the model's OWN tapped VL features -> co-trained
+    # vl_proj + flow map (intent_stack.pt), not the ResNet IntentGenerator sidecar.
+    ap.add_argument("--vl-cotrain", action="store_true",
+                    help="VL-grounded intent: tap the model's PaliGemma image tokens -> vl_proj -> flow map")
+    ap.add_argument("--intent-stack", default=None, help="intent_stack.pt (vl_proj + intent_flow_map) for --vl-cotrain")
+    ap.add_argument("--fp32", action="store_true", help="force the policy model to float32 (pi05_base overflows bf16)")
+    # M3 (decoupled VL): the generator was trained on FROZEN pi05_base VL, so at deploy the VL tap
+    # must use a frozen pi05_base -- NOT the finetuned policy's VL. Load it separately for the tap.
+    ap.add_argument("--frozen-base-weights", default=None,
+                    help="M3: dir of a frozen pi05_base PyTorch (model.safetensors) used ONLY for the VL tap")
+    ap.add_argument("--frozen-base-config", default="pi05_base_nointent",
+                    help="config to build the frozen-base PyTorch model architecture")
+    # DINOv2/DynaFLIP arms: the slot-intent generator was trained on an ALTERNATIVE encoder's
+    # agentview patch grid (not pi05 VL), so the deploy VL tap must run THAT encoder per step.
+    ap.add_argument("--encoder-tap", default=None, choices=["dinov2", "dynaflip"],
+                    help="tap an alt vision encoder (agentview-only) for the intent generator instead of pi05 VL")
     ap.add_argument("--config-dir", default="examples/configs")
+    # FIXED-M4: the deployable generator is an aux MLP (vl_mean -> z_hat), not the flow map.
+    ap.add_argument("--aux-head", default=None,
+                    help="FIXED-M4: aux_head.pt; z_hat = aux_head(pi05 vl_mean) fed to the action head")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -98,6 +117,8 @@ def main():
         data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
         norm_stats = _checkpoints.load_norm_stats(train_config.assets_dirs, data_config.asset_id)
     policy = _policy_config.create_trained_policy(train_config, args.checkpoint_dir, norm_stats=norm_stats)
+    if args.fp32 and not args.frozen_base_weights:
+        policy._model = policy._model.float()  # pi05_base overflows bf16 -> fp32 forward (ALL paths)
 
     # ---- optional intent generator (MIP flow map sidecar) ----
     gen = None
@@ -106,6 +127,75 @@ def main():
         assert args.intent_ckpt, "--intent requires --intent-ckpt"
         gen = IntentGenerator(args.intent_task_config, args.intent_ckpt, args.config_dir, device=args.device)
     obs_steps = gen.obs_steps if gen is not None else 1
+
+    # ---- VL co-train intent: tap the model's own PaliGemma image tokens -> co-trained
+    #      vl_proj -> flow map (intent_stack.pt). No ResNet sidecar. ----
+    vl = None
+    if args.vl_cotrain:
+        import openpi.models.model as _model
+        from mip.pi05_intent import CotrainIntentModule
+        assert args.intent_stack or args.aux_head, "--vl-cotrain requires --intent-stack or --aux-head"
+        cot = CotrainIntentModule(args.intent_task_config, args.config_dir, device=args.device, vl_obs=True)
+        if args.intent_stack:  # flow-map generator (M2/M3/DINOv2); FIXED-M4 uses --aux-head instead
+            stack = torch.load(args.intent_stack, map_location=args.device, weights_only=False)
+            vlw = stack["vl_proj"]["weight"].shape[1]
+            cot.vl_proj(torch.zeros(1, vlw, device=args.device))         # materialize LazyLinear before load
+            cot.vl_proj.load_state_dict(stack["vl_proj"])
+            cot.agent.intent_flow_map.load_state_dict(stack["intent_flow_map"])
+        cot.eval()
+        # M3: load a FROZEN pi05_base for the VL tap (decoupled generator was trained on frozen-base
+        # VL, not the finetuned policy's VL). Falls back to the policy's own VL (M2 co-train) if unset.
+        vl_model = policy._model
+        if args.frozen_base_weights:
+            from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
+            import safetensors.torch as _stt
+            fb_cfg = _config.get_config(args.frozen_base_config)
+            vl_model = PI0Pytorch(fb_cfg.model).to(args.device)
+            _stt.load_model(vl_model, str(pathlib.Path(args.frozen_base_weights) / "model.safetensors"), strict=False)
+            vl_model = vl_model.float().eval()
+
+        # DINOv2/DynaFLIP arms: tap that encoder's AGENTVIEW patch grid (the generator was trained on
+        # it), not pi05 VL. Reuse the precompute featurizer (same model/preprocess as the cache).
+        featurize = None
+        if args.encoder_tap:
+            from precompute_encoder_grids import _load_encoder
+            featurize = _load_encoder(args.encoder_tap, args.device)
+
+        # FIXED-M4: rebuild the aux MLP generator (vl_mean -> z_hat). Input dim from the saved 1st layer.
+        aux_head_eval = None
+        if args.aux_head:
+            _ah = torch.load(args.aux_head, map_location=args.device, weights_only=False)["aux_head"]
+            _in = _ah["0.weight"].shape[1]
+            aux_head_eval = torch.nn.Sequential(
+                torch.nn.Linear(_in, 512), torch.nn.GELU(), torch.nn.Linear(512, cot.intent_dim)).to(args.device)
+            aux_head_eval.load_state_dict(_ah)
+            aux_head_eval.eval()
+
+        def _to_obs(inp):
+            def conv(v):
+                if isinstance(v, dict):
+                    return {k: conv(vv) for k, vv in v.items()}
+                t = torch.as_tensor(np.asarray(v), device=args.device)
+                return (t.float() if t.is_floating_point() else t)[None]  # add batch dim
+            return _model.Observation.from_dict(conv(inp))
+
+        def _vl_intent(element):
+            if aux_head_eval is not None:  # FIXED-M4: aux MLP generator on the pi05 vl_mean
+                el = dict(element); el["intent"] = np.zeros(cot.intent_dim, dtype=np.float32)
+                obs_t = _to_obs(policy._input_transform(el))
+                with torch.no_grad():
+                    z = aux_head_eval(vl_model.vl_image_features(obs_t))
+            elif featurize is not None:  # alt-encoder agentview grid -> mean -> generator
+                grid = featurize([element["observation/image"]])      # (1, N, dim)
+                with torch.no_grad():
+                    z = cot.vl_sample_intent(grid.mean(dim=1).to(args.device).float())
+            else:                      # pi05 VL tap (M2 co-train / M3 frozen-base)
+                el = dict(element); el["intent"] = np.zeros(cot.intent_dim, dtype=np.float32)
+                obs_t = _to_obs(policy._input_transform(el))
+                with torch.no_grad():
+                    z = cot.vl_sample_intent(vl_model.vl_image_features(obs_t))
+            return z[0].detach().cpu().numpy().astype(np.float32)
+        vl = _vl_intent
 
     # ---- LIBERO suite ----
     from libero.libero import benchmark, get_libero_path
@@ -167,6 +257,8 @@ def main():
                         iw = {"agentview_rgb": np.stack([w[1] for w in win])[None],
                               "eye_in_hand_rgb": np.stack([w[2] for w in win])[None]}
                         element["intent"] = gen.intent_for_windows(sw, iw)[0].astype(np.float32)
+                    if vl is not None:
+                        element["intent"] = vl(element)
                     action_chunk = np.asarray(policy.infer(element)["actions"])
                     plan.extend(action_chunk[: args.replan_steps])
                 obs, _, done, _ = env.step(plan.popleft().tolist())

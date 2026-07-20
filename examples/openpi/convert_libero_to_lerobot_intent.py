@@ -34,6 +34,7 @@ import shutil
 
 import h5py
 import numpy as np
+import torch
 from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
 
 from mip.pi05_intent import IntentGenerator
@@ -51,19 +52,39 @@ def _prompt_from_path(path: str) -> str:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--task-config", required=True, help="MIP task config the ckpt was trained with")
-    ap.add_argument("--ckpt", required=True, help="MIP flow_intent agent checkpoint")
+    ap.add_argument("--ckpt", default=None, help="MIP flow_intent agent checkpoint (ResNet generator)")
     ap.add_argument("--repo-id", required=True, help="output LeRobot dataset repo id")
     ap.add_argument("--config-dir", default="examples/configs")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--max-demos", type=int, default=-1, help="limit demos per file (debug); -1 = all")
     ap.add_argument("--intent-batch", type=int, default=256, help="frames per intent forward pass")
+    # M3 (VL-grounded, decoupled): intent comes from the Stage-1 VL generator (vl_proj + flow map)
+    # applied to the cached frozen-pi05_base VL agentview-grid mean -- NOT the ResNet IntentGenerator.
+    ap.add_argument("--m3-vl-stack", default=None, help="M3: intent_stack_*.pt (vl_proj + intent_flow_map)")
+    ap.add_argument("--vl-cache-dir", default=None, help="M3: dir of per-demo VL grid .npy (precompute_vl_grids)")
     args = ap.parse_args()
 
-    gen = IntentGenerator(args.task_config, args.ckpt, args.config_dir, device=args.device)
-    dataset_paths = [os.path.expanduser(p) for p in gen.cfg.task.dataset_paths]
-    To = gen.obs_steps
     img_key, wrist_key = "agentview_rgb", "eye_in_hand_rgb"
-    print(f"[convert] intent_dim={gen.intent_dim}, obs_steps={To}, {len(dataset_paths)} files")
+    m3 = bool(args.m3_vl_stack)
+    if m3:  # M3: VL generator on cached frozen-pi05_base VL grids
+        from mip.pi05_intent import CotrainIntentModule
+        assert args.vl_cache_dir, "--m3-vl-stack requires --vl-cache-dir"
+        cot = CotrainIntentModule(args.task_config, args.config_dir, device=args.device, vl_obs=True)
+        cot.vl_proj(torch.zeros(1, int(cot.cfg.task.slot_vl_dim), device=args.device))  # materialize LazyLinear
+        _st = torch.load(args.m3_vl_stack, map_location=args.device, weights_only=False)
+        cot.vl_proj.load_state_dict(_st["vl_proj"])
+        cot.agent.intent_flow_map.load_state_dict(_st["intent_flow_map"])
+        cot.eval()
+        intent_dim = cot.intent_dim
+        dataset_paths = [os.path.expanduser(p) for p in cot.cfg.task.dataset_paths]
+        print(f"[convert-M3] intent_dim={intent_dim}, VL stack step {_st.get('step')}, {len(dataset_paths)} files")
+    else:
+        assert args.ckpt, "ResNet mode requires --ckpt"
+        gen = IntentGenerator(args.task_config, args.ckpt, args.config_dir, device=args.device)
+        intent_dim = gen.intent_dim
+        To = gen.obs_steps
+        dataset_paths = [os.path.expanduser(p) for p in gen.cfg.task.dataset_paths]
+        print(f"[convert] intent_dim={intent_dim}, obs_steps={To}, {len(dataset_paths)} files")
 
     output_path = HF_LEROBOT_HOME / args.repo_id
     if output_path.exists():
@@ -78,7 +99,7 @@ def main():
             "wrist_image": {"dtype": "image", "shape": (128, 128, 3), "names": ["height", "width", "channel"]},
             "state": {"dtype": "float32", "shape": (8,), "names": ["state"]},
             "actions": {"dtype": "float32", "shape": (7,), "names": ["actions"]},
-            "intent": {"dtype": "float32", "shape": (gen.intent_dim,), "names": ["intent"]},
+            "intent": {"dtype": "float32", "shape": (intent_dim,), "names": ["intent"]},
         },
         image_writer_threads=10,
         image_writer_processes=5,
@@ -102,26 +123,40 @@ def main():
                 T = act.shape[0]
 
                 state8 = np.concatenate([ee, grip], axis=-1)[:T]              # (T,8) -> Pi0.5
-                state15 = np.concatenate([ee, grip, joint], axis=-1)[:T]      # (T,15) -> flow map
 
-                # Build obs windows (T,To,...) and compute intent in batches.
-                sw = IntentGenerator.stack_windows(state15, To)              # (T,To,15)
-                agv_chw = np.moveaxis(agv[:T], -1, 1)                        # (T,3,128,128)
-                wrist_chw = np.moveaxis(wrist[:T], -1, 1)
-                iw = {
-                    img_key: IntentGenerator.stack_windows(agv_chw, To),
-                    wrist_key: IntentGenerator.stack_windows(wrist_chw, To),
-                }
-                intents = np.concatenate(
-                    [
-                        gen.intent_for_windows(
-                            sw[i : i + args.intent_batch],
-                            {k: v[i : i + args.intent_batch] for k, v in iw.items()},
-                        )
-                        for i in range(0, T, args.intent_batch)
-                    ],
-                    axis=0,
-                )  # (T, intent_dim)
+                if m3:
+                    # M3: per-frame intent = VL generator on the cached frozen-pi05_base VL
+                    # agentview-grid mean (the same signal eval taps live). One sample per frame.
+                    stem = os.path.basename(path).replace("_demo.hdf5", "").replace(".hdf5", "")  # == precompute key
+                    grid = np.load(os.path.join(args.vl_cache_dir, f"{stem}__{demo_key}.npy"))  # (T,256,2048) fp16
+                    vlm = grid[:T].astype(np.float32).mean(axis=1)                               # (T,2048)
+                    with torch.no_grad():
+                        intents = np.concatenate(
+                            [cot.vl_sample_intent(torch.from_numpy(vlm[i : i + args.intent_batch]).to(args.device))
+                                .cpu().numpy()
+                             for i in range(0, T, args.intent_batch)],
+                            axis=0,
+                        )  # (T, intent_dim)
+                else:
+                    # ResNet generator (M1): intent from state+image obs windows.
+                    state15 = np.concatenate([ee, grip, joint], axis=-1)[:T]  # (T,15) -> flow map
+                    sw = IntentGenerator.stack_windows(state15, To)           # (T,To,15)
+                    agv_chw = np.moveaxis(agv[:T], -1, 1)                     # (T,3,128,128)
+                    wrist_chw = np.moveaxis(wrist[:T], -1, 1)
+                    iw = {
+                        img_key: IntentGenerator.stack_windows(agv_chw, To),
+                        wrist_key: IntentGenerator.stack_windows(wrist_chw, To),
+                    }
+                    intents = np.concatenate(
+                        [
+                            gen.intent_for_windows(
+                                sw[i : i + args.intent_batch],
+                                {k: v[i : i + args.intent_batch] for k, v in iw.items()},
+                            )
+                            for i in range(0, T, args.intent_batch)
+                        ],
+                        axis=0,
+                    )  # (T, intent_dim)
 
                 for t in range(T):
                     dataset.add_frame(
