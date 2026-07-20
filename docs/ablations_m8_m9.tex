@@ -1,0 +1,74 @@
+% Ablation grid for the intent-head arms on pi0.5 (LIBERO-goal).
+% M8 = workspace-conditioned head (w_t CFG-conditions, w_{t+1} JEPA target).
+% M9 = the same head with w removed entirely (no CFG, no JEPA, no stage-1/precompute).
+%
+% Loss (M8):  L = L_BC + lambda_1 * L_intent + lambda_2 * L_JEPA + lambda_3 * L_SIGReg
+% Loss (M9):  L = L_BC + lambda_1 * L_intent
+%
+% Requires: booktabs, multirow.  Compile with pdflatex.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}cllll@{}}
+\toprule
+\textbf{\#} & \textbf{Axis} & \textbf{Variant} & \textbf{Implementation} & \textbf{Status} \\
+\midrule
+
+% ---------------- 1. loss flow / stop-grad ----------------
+\multirow{4}{*}{1}
+ & \multirow{4}{*}{Loss flow (stop-grad)}
+ & Stop-grad everywhere            & $w_t$, $w_{t+1}$ both precomputed (frozen) & \textbf{current} \\
+ & & No stop-grad on JEPA          & $w_{t+1}$ computed live from the encoder   & todo \\
+ & & No stop-grad on $w_t$         & CFG condition backprops into the encoder   & todo \\
+ & & No stop-grad anywhere         & workspace encoder trains end-to-end        & todo \\
+\midrule
+
+% ---------------- 2. weights ----------------
+\multirow{2}{*}{2}
+ & \multirow{2}{*}{Aux weights}
+ & $\lambda_1=\lambda_2=1$, $\lambda_3=0$     & \texttt{--wsm-\{intent,jepa\}-weight 1.0}  & \textbf{done}: 61.0\,\% \\
+ & & $\lambda_1=\lambda_2=0.25$, $\lambda_3=0$ & \texttt{--wsm-\{intent,jepa\}-weight 0.25} & \textbf{done}: 73.0\,\% \\
+\midrule
+
+% ---------------- 3. intent target ----------------
+\multirow{2}{*}{3}
+ & \multirow{2}{*}{Intent target}
+ & Mean, $h\in\{8,16,32\}$    & \texttt{--intent-flow-target mean}   & \textbf{done} ($h{=}8$) \\
+ & & Concat, $h\in\{8,16,32\}$ & \texttt{--intent-flow-target concat} & \textbf{running} ($h{=}8$) \\
+\midrule
+
+% ---------------- 4. what w_t conditions ----------------
+\multirow{3}{*}{4}
+ & \multirow{3}{*}{$w_t$ conditions}
+ & Intent head only  & CFG cond on MLP layer 1 (deploy $=$ baseline) & \textbf{current} \\
+ & & Action head only & \texttt{intent\_proj} $\to$ adaRMS (in deploy graph) & todo \\
+ & & Intent $+$ action & both seams                                   & todo \\
+\midrule
+
+% ---------------- 5. intent loss ----------------
+\multirow{3}{*}{5}
+ & \multirow{3}{*}{Intent loss}
+ & MSE (cond.\ mean)          & \texttt{--intent-flow-decoder mse}  & \textbf{done} (M8) \\
+ & & L1 (cond.\ median)        & \texttt{--intent-flow-decoder l1}   & todo \\
+ & & Flow head (distribution)  & \texttt{--intent-flow-decoder flow} & \textbf{running} (M9) \\
+\midrule
+
+% ---------------- 0. the removal itself ----------------
+\multirow{2}{*}{0}
+ & \multirow{2}{*}{Workspace token}
+ & With $w$ (M8)     & CFG $w_t$ $+$ JEPA $w_{t+1}$; needs stage-1 $+$ precompute & \textbf{done}: 73.0\,\% \\
+ & & Without $w$ (M9) & head reads the penultimate only; no stage-1              & \textbf{running} \\
+
+\bottomrule
+\end{tabular}
+\caption{Ablation grid for the intent-head arms on pi0.5 (LIBERO-goal, 20 trials/task,
+mean SR over 10 tasks). All aux losses are train-time only: the deploy graph is baseline
+pi0.5 in every row, so SR differences reflect only how the shared action-expert penultimate
+was reshaped during training. Reported SR: $\lambda{=}1$ at 20k steps, $\lambda{=}0.25$ at
+12k steps. \textbf{No matched pure-BC control has been run yet}, so absolute SR is not yet
+interpretable; only within-axis comparisons at matched steps are.}
+\label{tab:ablations}
+\end{table}
