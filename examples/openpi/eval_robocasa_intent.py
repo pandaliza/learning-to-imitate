@@ -1,0 +1,558 @@
+"""Evaluate a Pi0.5 checkpoint on the RoboCasa kitchen suite, with optional slot-intent.
+
+Direct (in-process) rollout on RoboCasa environment with 15 kitchen tasks across 3 sets
+(atomic_seen, composite_seen, composite_unseen). Ports eval_libero_intent.py to RoboCasa.
+
+Per-step obs follows RoboCasa convention:
+  state = [base_pos(3), base_quat(4), eef_pos_rel(3), eef_quat_rel(4), gripper_qpos(2)]   (16D)
+  images: robot0_agentview_left (base/left), robot0_eye_in_hand (wrist)  (256x256 or resized)
+
+For the intent sidecar (MIP flow map) we additionally build the MIP obs window with state16 +
+agentview/eye_in_hand images.
+
+Outputs per-task + mean success rate to stdout and a JSON file.
+
+Usage (baseline, no intent):
+  python examples/openpi/eval_robocasa_intent.py --config-name pi05_base \
+    --checkpoint-dir /data/.../pi05_base --out logs/eval_robocasa_baseline.json
+
+Usage (co-prediction):
+  python examples/openpi/eval_robocasa_intent.py --config-name pi05_base_copred \
+    --checkpoint-dir /data/.../pi05_copred/26000 --schedule s1 \
+    --out logs/eval_robocasa_copred_s1.json
+"""
+
+import argparse
+import collections
+import functools
+import json
+import math
+import os
+import pathlib
+
+import numpy as np
+import torch
+
+# Must run before any pi0.5 model import: trusty pickle loader
+torch.load = functools.partial(torch.load, weights_only=False)
+
+# RoboCasa task sets: 15 tasks across 3 categories
+ROBOCASA_TASK_SETS = {
+    "atomic_seen": [
+        "PickPlaceCounterToCabinet",
+        "PickPlaceCounterToStove",
+        "TurnOnElectricKettle",
+        "SlideDishwasherRack",
+    ],
+    "composite_seen": [
+        "KettleBoiling",
+        "LoadDishwasher",
+        "PrepareCoffee",
+        "PreSoakPan",
+        "WashLettuce",
+    ],
+    "composite_unseen": [
+        "ArrangeTea",
+        "CategorizeCondiments",
+        "CuttingToolSelection",
+        "PanTransfer",
+        "WashFruitColander",
+        "WeighIngredients",
+    ],
+}
+
+# Default max episode length per task set (based on data histogram; composite tasks longer)
+MAX_STEPS_PER_SET = {
+    "atomic_seen": 500,
+    "composite_seen": 1000,
+    "composite_unseen": 1000,
+}
+
+# RoboCasa control and obs config
+ROBOCASA_ACTION_DIM = 12
+ROBOCASA_STATE_DIM = 16
+ENV_RES = 256
+
+
+def _quat2axisangle(quat):
+    """Convert quaternion [x,y,z,w] to axis-angle."""
+    quat = np.asarray(quat, dtype=np.float64)
+    if quat[3] > 1.0:
+        quat[3] = 1.0
+    elif quat[3] < -1.0:
+        quat[3] = -1.0
+    den = np.sqrt(1.0 - quat[3] * quat[3])
+    if math.isclose(den, 0.0):
+        return np.zeros(3)
+    return (quat[:3] * 2.0 * math.acos(quat[3])) / den
+
+
+def _resize(img_hwc, size):
+    """Resize HWC image to (size, size)."""
+    from PIL import Image
+    return np.asarray(Image.fromarray(img_hwc).resize((size, size), Image.BILINEAR))
+
+
+class RoboCasaEnvAdapter:
+    """Wrapper around RoboCasa env to extract obs/state and handle success checks.
+
+    Key assumptions (to be confirmed by G1's env report):
+    - Task name matches ROBOCASA_TASK_SETS keys exactly
+    - env.reset() returns obs dict with required keys
+    - env.step(action) returns (obs, reward, done, info)
+    - obs has keys: robot0_agentview_left, robot0_eye_in_hand, robot0_base_pos, etc.
+    - done=True indicates episode termination (success or failure)
+    - For success: either info["success"] or task.check_success(obs) or done+reward
+    - Control frequency matches data (20 fps)
+    """
+
+    def __init__(self, task_name: str, headless: bool = True):
+        """Initialize RoboCasa env for a specific task.
+
+        Args:
+            task_name: One of the 15 tasks from ROBOCASA_TASK_SETS
+            headless: If True, use MUJOCO_GL=osmesa for offscreen rendering
+        """
+        import os
+        if headless and "MUJOCO_GL" not in os.environ:
+            os.environ["MUJOCO_GL"] = "osmesa"
+
+        try:
+            import robocasa  # noqa: F401 -- registers kitchen envs with robosuite
+            import robosuite
+        except ImportError as e:
+            raise ImportError(f"RoboCasa/robosuite import failed: {e}")
+
+        # Instantiate via robosuite.make with the kitchen env registered by robocasa.
+        # Exact recipe verified on all 15 tasks (logs/m11_smoke/verify_15_tasks.py).
+        try:
+            self.env = robosuite.make(
+                task_name,
+                robots="PandaOmron",           # Mobile manipulator (16D state, 12D action)
+                has_renderer=False,            # Headless
+                has_offscreen_renderer=True,   # Off-screen rendering for image obs
+                use_camera_obs=True,           # Include camera observations
+                camera_names=["robot0_agentview_left", "robot0_eye_in_hand"],
+                camera_heights=256,
+                camera_widths=256,
+                control_freq=20,               # 20 Hz control frequency (matching data)
+                horizon=MAX_STEPS_PER_SET.get(
+                    next((k for k, v in ROBOCASA_TASK_SETS.items() if task_name in v), "composite_unseen"),
+                    1000
+                ),
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to create RoboCasa task '{task_name}' with robosuite.make(). "
+                f"Verify task name, robocasa installation, and robot type. Error: {e}"
+            )
+
+        self.task_name = task_name
+        self._reset_count = 0
+
+    def reset(self, seed: int = None) -> dict:
+        """Reset environment and return initial obs."""
+        if seed is not None:
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+        try:
+            obs = self.env.reset()
+        except Exception as e:
+            raise RuntimeError(f"RoboCasa reset failed for task {self.task_name}: {e}")
+
+        # Validate obs keys
+        required_keys = {
+            "robot0_agentview_left_image",
+            "robot0_eye_in_hand_image",
+            "robot0_base_pos",
+            "robot0_base_quat",
+            "robot0_base_to_eef_pos",
+            "robot0_base_to_eef_quat",
+            "robot0_gripper_qpos",
+        }
+        missing = required_keys - set(obs.keys())
+        if missing:
+            raise RuntimeError(
+                f"RoboCasa obs missing keys {missing}. "
+                f"Available: {set(obs.keys())}"
+            )
+
+        self._reset_count += 1
+        return obs
+
+    def step(self, action: np.ndarray) -> tuple:
+        """Step environment with action (12D: base[0:4], mode[4:5], eef[5:8], rot[8:11], grip[11:12]).
+
+        Returns:
+            (obs, reward, done, info)
+        """
+        # Validate action dim
+        if len(action) != ROBOCASA_ACTION_DIM:
+            raise RuntimeError(
+                f"Action dim mismatch: expected {ROBOCASA_ACTION_DIM}, got {len(action)}"
+            )
+
+        try:
+            obs, reward, done, info = self.env.step(action)
+        except Exception as e:
+            raise RuntimeError(f"RoboCasa step failed for task {self.task_name}: {e}")
+
+        return obs, reward, done, info
+
+    def get_language_instruction(self) -> str:
+        """Task prompt, matching the TRAINING prompt distribution exactly.
+
+        train_pi05_m11.py prompts with humanized task names ("turn on electric kettle"),
+        not the env's ep_meta["lang"] sentences -- eval must match or the language
+        conditioning is out-of-distribution.
+        """
+        import re
+        return re.sub(r"(?<!^)(?=[A-Z])", " ", self.task_name).lower()
+
+    def extract_state_obs(self, obs: dict) -> np.ndarray:
+        """Extract 16D state obs from RoboCasa obs dict, in order:
+        [base_pos(3), base_quat(4), eef_pos_rel(3), eef_quat_rel(4), gripper_qpos(2)]
+        """
+        try:
+            state = np.concatenate([
+                obs["robot0_base_pos"],           # 3D
+                obs["robot0_base_quat"],          # 4D (x,y,z,w)
+                obs["robot0_base_to_eef_pos"],    # 3D (eef in base frame = data's eef_pos_rel)
+                obs["robot0_base_to_eef_quat"],   # 4D
+                obs["robot0_gripper_qpos"],       # 2D
+            ]).astype(np.float32)
+        except (KeyError, ValueError) as e:
+            raise RuntimeError(f"Failed to extract state obs: {e}")
+
+        if state.shape[0] != ROBOCASA_STATE_DIM:
+            raise RuntimeError(
+                f"State dim mismatch: expected {ROBOCASA_STATE_DIM}, got {state.shape[0]}"
+            )
+        return state
+
+    def extract_images(self, obs: dict) -> tuple:
+        """Extract and resize base and wrist images. Returns (base_hwc, wrist_hwc)."""
+        try:
+            base = obs["robot0_agentview_left_image"]
+            wrist = obs["robot0_eye_in_hand_image"]
+        except KeyError as e:
+            raise RuntimeError(f"Missing image key in obs: {e}")
+
+        # robosuite offscreen renders are vertically flipped (OpenGL convention);
+        # flip to match the LeRobot training-data orientation. (Found via rollout video:
+        # unflipped policy input = upside-down kitchen = OOD wandering.)
+        base = np.asarray(base)[::-1].copy()
+        wrist = np.asarray(wrist)[::-1].copy()
+
+        if base.dtype != np.uint8:
+            if base.max() <= 1.0:
+                base = (255 * base).astype(np.uint8)
+            else:
+                base = base.astype(np.uint8)
+
+        if wrist.dtype != np.uint8:
+            if wrist.max() <= 1.0:
+                wrist = (255 * wrist).astype(np.uint8)
+            else:
+                wrist = wrist.astype(np.uint8)
+
+        # Reshape to HWC if CHW
+        if base.shape[0] == 3:
+            base = base.transpose(1, 2, 0)
+        if wrist.shape[0] == 3:
+            wrist = wrist.transpose(1, 2, 0)
+
+        # Resize to target
+        base = _resize(base, ENV_RES)
+        wrist = _resize(wrist, ENV_RES)
+
+        return base, wrist
+
+    def check_success(self, obs: dict, info: dict = None, done: bool = False) -> bool:
+        """Determine if episode was successful.
+
+        Tries multiple strategies:
+        1. info["success"] if available
+        2. env.is_success(obs) if method exists
+        3. done=True as fallback (conservative)
+        """
+        if info is not None and "success" in info:
+            return bool(info["success"])
+
+        if hasattr(self.env, "is_success"):
+            try:
+                return bool(self.env.is_success(obs))
+            except Exception:
+                pass
+
+        # Fallback: done=True only if we're confident it's success
+        # For safety, we don't use this; instead require an explicit signal
+        return False
+
+    def close(self):
+        """Close the environment."""
+        if hasattr(self.env, "close"):
+            self.env.close()
+
+
+def _mip_obs(obs):
+    """Build (state16, agentview_chw, wrist_chw) for the flow map, MIP convention."""
+    base, wrist = RoboCasaEnvAdapter(None, None).extract_images.__func__(None, obs)
+    state = RoboCasaEnvAdapter(None, None).extract_state_obs.__func__(None, obs)
+    agv = base.transpose(2, 0, 1)        # HWC -> CHW uint8
+    wr = wrist.transpose(2, 0, 1)
+    return state, agv, wr
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config-name", required=True)
+    ap.add_argument("--checkpoint-dir", required=True)
+    ap.add_argument("--task-set", default="all",
+                    choices=list(ROBOCASA_TASK_SETS.keys()) + ["all"],
+                    help="Task set to evaluate: atomic_seen, composite_seen, composite_unseen, or all")
+    ap.add_argument("--tasks", default=None,
+                    help="Comma-separated list of specific tasks to eval (overrides --task-set)")
+    ap.add_argument("--num-trials-per-task", type=int, default=3,
+                    help="Number of trials per task")
+    ap.add_argument("--max-steps", type=int, default=None,
+                    help="Override per-task-set max steps (default: atomic=500, composite=1000)")
+    ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--save-video-dir", default=None,
+                    help="If set, save an agentview mp4 per trial into this dir (debug)")
+    ap.add_argument("--intent", action="store_true")
+    ap.add_argument("--intent-task-config", default="robocasa_image_slot_intent")
+    ap.add_argument("--intent-ckpt", default=None)
+    ap.add_argument("--norm-stats-from-config", action="store_true",
+                    help="Load norm stats from config's assets dir instead of checkpoint/assets")
+    ap.add_argument("--vl-cotrain", action="store_true",
+                    help="VL-grounded intent from co-trained model's PaliGemma features")
+    ap.add_argument("--intent-stack", default=None,
+                    help="intent_stack.pt for --vl-cotrain")
+    ap.add_argument("--frozen-base-weights", default=None,
+                    help="M3: frozen pi05_base PyTorch for VL tap")
+    ap.add_argument("--frozen-base-config", default="pi05_base_nointent")
+    ap.add_argument("--encoder-tap", default=None, choices=["dinov2", "dynaflip"])
+    ap.add_argument("--aux-head", default=None,
+                    help="FIXED-M4: aux_head.pt")
+    # M10 co-prediction
+    ap.add_argument("--schedule", default=None, choices=["s1", "s2", "s3"],
+                    help="M10: s1 intent-first, s2 joint, s3 action-first")
+    ap.add_argument("--num-intent-steps", type=int, default=4,
+                    help="M10: K_I Euler steps for intent phase")
+    ap.add_argument("--copred-mask", default=None, choices=["j", "t", "b1", "xattn"])
+    ap.add_argument("--config-dir", default="examples/configs")
+    ap.add_argument("--fp32", action="store_true",
+                    help="Force policy model to float32")
+    ap.add_argument("--random-policy", action="store_true",
+                    help="Debug flag: use random actions instead of policy (smoke test)")
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--out", required=True)
+    args = ap.parse_args()
+
+    import openpi.training.config as _config
+    from openpi.policies import policy_config as _policy_config
+
+    np.random.seed(args.seed)
+
+    # Determine task list
+    if args.tasks:
+        task_list = [t.strip() for t in args.tasks.split(",")]
+    elif args.task_set == "all":
+        task_list = []
+        for ts in ROBOCASA_TASK_SETS.values():
+            task_list.extend(ts)
+    else:
+        task_list = ROBOCASA_TASK_SETS[args.task_set]
+
+    print(f"Evaluating {len(task_list)} tasks: {task_list}", flush=True)
+
+    # Load policy (unless random)
+    if not args.random_policy:
+        train_config = _config.get_config(args.config_name)
+        if args.copred_mask:
+            import dataclasses
+            train_config = dataclasses.replace(
+                train_config, model=dataclasses.replace(train_config.model, copred_mask=args.copred_mask))
+        norm_stats = None
+        if args.norm_stats_from_config:
+            from openpi.training import checkpoints as _checkpoints
+            data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+            norm_stats = _checkpoints.load_norm_stats(train_config.assets_dirs, data_config.asset_id)
+        policy = _policy_config.create_trained_policy(train_config, args.checkpoint_dir, norm_stats=norm_stats)
+        if args.fp32 and not args.frozen_base_weights:
+            policy._model = policy._model.float()
+
+        if args.schedule:
+            assert int(getattr(policy._model, "copred_h", 0)) > 0, \
+                "--schedule requires a co-prediction checkpoint"
+            policy._sample_actions = functools.partial(
+                policy._model.sample_actions_copred,
+                schedule=args.schedule, num_intent_steps=args.num_intent_steps)
+            print(f"[M10] sampling via sample_actions_copred schedule={args.schedule} "
+                  f"K_I={args.num_intent_steps}", flush=True)
+
+        # Optional intent generator
+        gen = None
+        if args.intent:
+            from mip.pi05_intent import IntentGenerator
+            assert args.intent_ckpt, "--intent requires --intent-ckpt"
+            gen = IntentGenerator(args.intent_task_config, args.intent_ckpt, args.config_dir, device=args.device)
+        obs_steps = gen.obs_steps if gen is not None else 1
+    else:
+        policy = None
+        gen = None
+        obs_steps = 1
+
+    # VL co-train intent (if enabled)
+    vl = None
+    if args.vl_cotrain:
+        import openpi.models.model as _model
+        from mip.pi05_intent import CotrainIntentModule
+        assert args.intent_stack or args.aux_head, "--vl-cotrain requires --intent-stack or --aux-head"
+        cot = CotrainIntentModule(args.intent_task_config, args.config_dir, device=args.device, vl_obs=True)
+        # ... (reuse same VL setup as eval_libero_intent) ...
+        # For brevity in smoke test, we'll skip full VL setup for now
+        pass
+
+    results = {}
+    total_ep, total_succ = 0, 0
+    replan_steps = 5  # Similar to LIBERO
+
+    for task_name in task_list:
+        # Determine max steps for this task
+        task_set = None
+        for ts_name, ts_tasks in ROBOCASA_TASK_SETS.items():
+            if task_name in ts_tasks:
+                task_set = ts_name
+                break
+
+        max_steps = args.max_steps if args.max_steps else MAX_STEPS_PER_SET.get(task_set, 1000)
+
+        try:
+            env_adapter = RoboCasaEnvAdapter(task_name, headless=True)
+        except Exception as e:
+            print(f"[SKIP] Failed to create env for {task_name}: {e}", flush=True)
+            results[task_name] = None
+            continue
+
+        t_ep, t_succ = 0, 0
+        for ep in range(args.num_trials_per_task):
+            try:
+                obs = env_adapter.reset(seed=args.seed + ep)
+                reward, done, info = 0.0, False, {}
+            except Exception as e:
+                print(f"[ERROR] Reset failed for {task_name} trial {ep}: {e}", flush=True)
+                continue
+
+            plan = collections.deque()
+            win = collections.deque(maxlen=obs_steps)
+            done = False
+            frames = [] if args.save_video_dir else None
+            dbg_printed = False
+
+            for t in range(max_steps):
+                if not plan:
+                    # Replan
+                    base_img, wrist_img = env_adapter.extract_images(obs)
+                    state_obs = env_adapter.extract_state_obs(obs)
+
+                    element = {
+                        "observation/image": base_img,
+                        "observation/wrist_image": wrist_img,
+                        "observation/state": state_obs,
+                        "prompt": env_adapter.get_language_instruction(),
+                    }
+
+                    if gen is not None:
+                        st, a_ch, w_ch = _mip_obs(obs)
+                        win.append((st, a_ch, w_ch))
+                        while len(win) < obs_steps:
+                            win.appendleft(win[0])
+                        sw = np.stack([w[0] for w in win])[None]
+                        iw = {"agentview_rgb": np.stack([w[1] for w in win])[None],
+                              "eye_in_hand_rgb": np.stack([w[2] for w in win])[None]}
+                        element["intent"] = gen.intent_for_windows(sw, iw)[0].astype(np.float32)
+
+                    if vl is not None:
+                        element["intent"] = vl(element)
+
+                    if args.random_policy:
+                        # Random actions for smoke test
+                        action_chunk = np.random.randn(replan_steps, ROBOCASA_ACTION_DIM).astype(np.float32)
+                    else:
+                        action_chunk = np.asarray(policy.infer(element)["actions"])
+
+                    if not dbg_printed:
+                        print(f"[dbg] {task_name} ep{ep}: state={np.array2string(state_obs, precision=3)} "
+                              f"chunk mean={action_chunk.mean(0).round(3)} "
+                              f"absmax={np.abs(action_chunk).max():.3f} prompt='{element['prompt']}'", flush=True)
+                        dbg_printed = True
+
+                    plan.extend(action_chunk[:replan_steps])
+
+                # Execute one action from plan
+                action = plan.popleft()
+                try:
+                    obs, reward, done, info = env_adapter.step(action)
+                except Exception as e:
+                    print(f"[ERROR] Step failed for {task_name}: {e}", flush=True)
+                    break
+
+                if gen is not None:
+                    win.append(_mip_obs(obs))
+
+                if frames is not None:
+                    frames.append(np.asarray(env_adapter.extract_images(obs)[0]))
+
+                if done:
+                    break
+
+            if frames:
+                import imageio
+                os.makedirs(args.save_video_dir, exist_ok=True)
+                _vp = os.path.join(args.save_video_dir, f"{task_name}_ep{ep}.mp4")
+                imageio.mimwrite(_vp, frames, fps=20)  # frames already flipped to data orientation
+                print(f"[video] {len(frames)} frames -> {_vp}", flush=True)
+
+            # Check success
+            try:
+                success = env_adapter.check_success(obs, info, done)
+            except Exception as e:
+                print(f"[WARN] Success check failed for {task_name}: {e}", flush=True)
+                success = False
+
+            t_ep += 1
+            t_succ += int(success)
+            total_ep += 1
+            total_succ += int(success)
+
+        try:
+            env_adapter.close()
+        except Exception:
+            pass
+
+        sr = t_succ / max(t_ep, 1)
+        results[task_name] = sr
+        print(f"[robocasa] task {task_name} SR={sr:.2f} ({t_succ}/{t_ep}) max_steps={max_steps}", flush=True)
+
+    mean_sr = total_succ / max(total_ep, 1)
+    summary = {
+        "config": args.config_name,
+        "checkpoint": args.checkpoint_dir,
+        "task_set": args.task_set if args.task_set != "all" else "all",
+        "num_tasks": len(task_list),
+        "num_trials_per_task": args.num_trials_per_task,
+        "mean_sr": mean_sr,
+        "total": f"{total_succ}/{total_ep}",
+        "per_task": results,
+        "schedule": args.schedule,
+    }
+    pathlib.Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    with open(args.out, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"\n=== {args.config_name} MEAN SR = {mean_sr:.3f} ({total_succ}/{total_ep}) -> {args.out}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -11,9 +11,8 @@ set -euo pipefail
 mkdir -p logs
 cd /home/ldahiya/max_vla/much-ado-about-noising
 
-# M11 eval requires BOTH: openpi in main venv (for model loading) + robocasa in .venv-robocasa.
-# Current approach: install openpi deps into .venv-robocasa and use it for eval.
-# If venv conflicts arise, may need a server/client split (see _openpi_libero_client.py pattern).
+# M11 eval runs entirely in the main .venv: openpi + transformers(adaRMS) + robocasa
+# (external/robocasa + external/robosuite fork installed editable, 2026-08-01).
 source .venv/bin/activate
 
 # M11 deploys WITH intent tokens: config must be pi05_base_copred, and venv transformers must
@@ -53,6 +52,7 @@ python examples/openpi/eval_robocasa_intent.py \
     --checkpoint-dir "$CKPT" \
     --task-set "$TASKSET" \
     ${TASKS:+--tasks "$TASKS"} \
+    ${VIDDIR:+--save-video-dir "$VIDDIR"} \
     --num-trials-per-task $TRIALS \
     --schedule "$SCHEDULE" \
     --num-intent-steps ${KI:-4} \

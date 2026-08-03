@@ -66,17 +66,21 @@ OBJECT_QPOS_XYZ = {
 }
 
 # task_id -> (object_name, qpos_xyz_start) to perturb; None = skip
+# Target free-joint NAME per task; the flat-state index is resolved from the built env's
+# sim.model at runtime (jnt_qposadr + 1 for the leading `time`). Hardcoded indices are
+# forbidden here: an off-by-one (qpos addr vs flat idx) silently reclassified every failure
+# as no_reach and half-applied the perturbation for the entire first M10 campaign.
 TASK_TARGET = {
-    0: None,                    # "open middle drawer"       — drawer is a slide joint
-    1: ("bowl", 9),             # "put the bowl on the stove"
-    2: ("wine_bottle", 23),     # "put the wine bottle on top of the cabinet"
-    3: ("bowl", 9),             # "open top drawer and put bowl inside"
-    4: ("bowl", 9),             # "put the bowl on top of the cabinet"
-    5: ("plate", 30),           # "push the plate to the front of the stove"
-    6: ("cream_cheese", 16),    # "put the cream cheese in the bowl"
-    7: None,                    # "turn on the stove"        — button is a hinge joint
-    8: ("bowl", 9),             # "put the bowl on the plate"
-    9: ("wine_bottle", 23),     # "put the wine bottle on the rack"
+    0: None,                                            # "open middle drawer" — drawer is a slide joint
+    1: ("bowl", "akita_black_bowl_1_joint0"),           # "put the bowl on the stove"
+    2: ("wine_bottle", "wine_bottle_1_joint0"),         # "put the wine bottle on top of the cabinet"
+    3: ("bowl", "akita_black_bowl_1_joint0"),           # "open top drawer and put bowl inside"
+    4: ("bowl", "akita_black_bowl_1_joint0"),           # "put the bowl on top of the cabinet"
+    5: ("plate", "plate_1_joint0"),                     # "push the plate to the front of the stove"
+    6: ("cream_cheese", "cream_cheese_1_joint0"),       # "put the cream cheese in the bowl"
+    7: None,                                            # "turn on the stove" — button is a hinge joint
+    8: ("bowl", "akita_black_bowl_1_joint0"),           # "put the bowl on the plate"
+    9: ("wine_bottle", "wine_bottle_1_joint0"),         # "put the wine bottle on the rack"
 }
 
 
@@ -202,6 +206,13 @@ def main():
                          "variance); y is in-distribution to ~3σ≈0.03 m.")
     ap.add_argument("--replan-steps", type=int, default=5)
     ap.add_argument("--seed", type=int, default=7)
+    # M10 co-prediction: route sampling through sample_actions_copred (deploy graph has intent
+    # tokens). Mirrors eval_libero_intent.py; needs a copred checkpoint (--config-name pi05_base_copred).
+    ap.add_argument("--schedule", default=None, choices=["s1", "s2", "s3"],
+                    help="M10: s1 intent-first, s2 joint, s3 action-first control")
+    ap.add_argument("--num-intent-steps", type=int, default=4, help="M10: K_I Euler steps for the intent phase")
+    ap.add_argument("--copred-mask", default=None, choices=["j", "t", "b1"],
+                    help="M10: override the config's suffix mask variant to match the checkpoint")
     ap.add_argument("--rotate-images", action="store_true",
                     help="rotate 180° (needed for off-the-shelf pi05_libero; omit for our finetune)")
     ap.add_argument("--intent", action="store_true")
@@ -258,12 +269,25 @@ def main():
     np.random.seed(args.seed)
 
     train_config = _config.get_config(args.config_name)
+    if args.copred_mask:
+        import dataclasses
+        train_config = dataclasses.replace(
+            train_config, model=dataclasses.replace(train_config.model, copred_mask=args.copred_mask))
     norm_stats = None
     if args.norm_stats_from_config:
         from openpi.training import checkpoints as _checkpoints
         data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
         norm_stats = _checkpoints.load_norm_stats(train_config.assets_dirs, data_config.asset_id)
     policy = _policy_config.create_trained_policy(train_config, args.checkpoint_dir, norm_stats=norm_stats)
+    if args.schedule:
+        # M10: swap the sampler for the co-prediction schedule driver (same as eval_libero_intent.py);
+        # the rest of the policy pipeline (transforms, normalization, chunking) is untouched.
+        assert int(getattr(policy._model, "copred_h", 0)) > 0, \
+            "--schedule requires a co-prediction checkpoint (config with copred_h > 0)"
+        policy._sample_actions = functools.partial(
+            policy._model.sample_actions_copred,
+            schedule=args.schedule, num_intent_steps=args.num_intent_steps)
+        print(f"[M10] perturbed eval via sample_actions_copred schedule={args.schedule}", flush=True)
 
     gen = None
     if args.intent:
@@ -385,10 +409,6 @@ def main():
             print(f"[task {task_id}] SKIP — no free-joint target :: {task.language}", flush=True)
             continue
 
-        if args.task_target_qpos is not None:
-            obj_name, qpos_start = "override", args.task_target_qpos
-        else:
-            obj_name, qpos_start = target
         init_states = suite.get_task_init_states(task_id)
         bddl = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
         env = OffScreenRenderEnv(bddl_file_name=str(bddl), camera_heights=ENV_RES, camera_widths=ENV_RES)
@@ -397,10 +417,21 @@ def main():
         except (TypeError, AttributeError):
             pass
         env.reset()
+        if args.task_target_qpos is not None:
+            obj_name, qpos_start = "override", args.task_target_qpos
+        else:
+            obj_name, target_joint = target
+            sim = env.env.sim
+            jid = sim.model.joint_name2id(target_joint)
+            assert sim.model.jnt_type[jid] == 0, f"{target_joint} is not a free joint"
+            # flat sim state is [time, qpos, qvel] -> flat idx = qpos addr + 1
+            qpos_start = int(sim.model.jnt_qposadr[jid]) + 1
+            print(f"[task {task_id}] target={obj_name} joint={target_joint} flat_idx={qpos_start}", flush=True)
         robot_xy = _robot_base_xy(env)  # fixed per env; used for the optional reach check
         print(f"[task {task_id}] robot_base_xy={None if robot_xy is None else robot_xy.round(3).tolist()}  "
               f"tol(xy_eject={args.xy_eject_tol}, z_fall={args.z_fall_tol}, max_reach={args.max_reach})", flush=True)
 
+        settled_ref = {}  # trial_i -> settled unperturbed xyz (validity baseline; cancels the settle drop)
         for delta in deltas:
             t_ep = t_succ = t_valid = t_succ_valid = 0
             reasons = collections.Counter()
@@ -414,8 +445,17 @@ def main():
                     dx, dy = _disp(trial_i, delta)
                     init_state = _perturb(base, qpos_start, dx, dy)
                 else:
+                    dx = dy = 0.0
                     init_state = base
-                req_xyz = np.asarray(init_state[qpos_start:qpos_start + 3], dtype=np.float64).copy()
+                # Validity baseline: the SETTLED unperturbed pose (+ requested shift), not the raw
+                # init pose — init states start objects above the surface, and the settle drop
+                # would otherwise read as "fell" on every trial. Falls back to the raw init pose
+                # for delta orderings that hit delta>0 before 0.0.
+                ref = settled_ref.get(trial_i % len(init_states))
+                if ref is not None:
+                    req_xyz = ref + np.array([dx, dy, 0.0])
+                else:
+                    req_xyz = np.asarray(init_state[qpos_start:qpos_start + 3], dtype=np.float64).copy()
 
                 env.reset()
                 obs = env.set_init_state(init_state)
@@ -433,6 +473,8 @@ def main():
                     if settled_xyz is None:
                         settled_xyz = _object_xyz(env, qpos_start)  # read once, right after settling
                         obj_zmax = float(settled_xyz[2])
+                        if delta == 0.0 and trial_i % len(init_states) not in settled_ref:
+                            settled_ref[trial_i % len(init_states)] = settled_xyz.copy()
                     if not plan:
                         agv = obs["agentview_image"]
                         wr  = obs["robot0_eye_in_hand_image"]
@@ -491,7 +533,10 @@ def main():
                 reached = min_reach < args.reach_thresh
                 grasped = (obj_zmax - float(settled_xyz[2])) > args.lift_thresh
                 fclass  = _failure_class(done, reached, grasped)
-                valid, reason, _ = _validity(req_xyz, settled_xyz, robot_xy, args)
+                if delta == 0.0:
+                    valid, reason = True, "ok"   # unperturbed placement is valid by definition
+                else:
+                    valid, reason, _ = _validity(req_xyz, settled_xyz, robot_xy, args)
                 reasons[reason] += 0 if valid else 1
 
                 if record and frames:

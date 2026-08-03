@@ -1,0 +1,24 @@
+W3 DE-RISK STEP-0: TRAINING JOBS SUBMITTED
+==========================================
+Date: 2026-08-03
+Status: READY FOR EXECUTION (pending GPU quota)
+
+JOB IDs:
+  Baseline:    9709590 (w3-square-mh-baseline)
+  Flow-Intent: 9709591 (w3-square-mh-flow-intent)
+
+Check status:
+  squeue -j 9709590,9709591
+
+Config files created:
+  ✓ examples/configs/task/square_mh_state_flow_intent.yaml
+  
+Sbatch scripts created:
+  ✓ slurm-scripts/w3_derisk/train_square_mh_state_baseline.sbatch
+  ✓ slurm-scripts/w3_derisk/train_square_mh_state_flow_intent.sbatch
+
+Validation harness (step-0):
+  ✓ examples/eval/eval_w3_step0_validation.py (scaffold + gate definitions)
+  ✓ docs/w3_derisk/step0_setup_report.md (comprehensive guide)
+
+Next: Monitor training → evaluate gates (a/b/c) once checkpoints converge (~8h per job)

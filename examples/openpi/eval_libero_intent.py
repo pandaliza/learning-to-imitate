@@ -42,7 +42,8 @@ torch.load = functools.partial(torch.load, weights_only=False)
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 ENV_RES = 256
-MAX_STEPS = 300  # libero_goal: longest demo ~270 steps
+# Per-suite episode caps (openpi eval convention); default 300 covers libero_goal (longest demo ~270).
+MAX_STEPS_BY_SUITE = {"libero_spatial": 300, "libero_object": 300, "libero_goal": 300, "libero_10": 520}
 NUM_STEPS_WAIT = 10
 
 
@@ -62,6 +63,20 @@ def _resize(img_hwc, size):
     from PIL import Image
 
     return np.asarray(Image.fromarray(img_hwc).resize((size, size), Image.BILINEAR))
+
+
+def _video_frame(obs):
+    """Human-viewable agentview+wrist side-by-side frame (robosuite renders are bottom-up)."""
+    agv = np.ascontiguousarray(obs["agentview_image"][::-1])
+    wr = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1])
+    return np.concatenate([agv, wr], axis=1)
+
+
+def _save_video(path, frames, fps=20):
+    import imageio
+    with imageio.get_writer(path, fps=fps, macro_block_size=1) as w:
+        for f in frames:
+            w.append_data(f)
 
 
 def main():
@@ -97,9 +112,24 @@ def main():
     ap.add_argument("--encoder-tap", default=None, choices=["dinov2", "dynaflip"],
                     help="tap an alt vision encoder (agentview-only) for the intent generator instead of pi05 VL")
     ap.add_argument("--config-dir", default="examples/configs")
+    ap.add_argument("--tasks", default=None,
+                    help="comma-separated task ids to eval (default: all tasks in the suite)")
+    ap.add_argument("--video-dir", default=None,
+                    help="if set, save agentview+wrist rollout mp4s here")
+    ap.add_argument("--videos-per-task", type=int, default=2,
+                    help="max rollout videos to save per task")
     # FIXED-M4: the deployable generator is an aux MLP (vl_mean -> z_hat), not the flow map.
     ap.add_argument("--aux-head", default=None,
                     help="FIXED-M4: aux_head.pt; z_hat = aux_head(pi05 vl_mean) fed to the action head")
+    # M10 co-prediction (docs/co_prediction.md section 4): route sampling through
+    # sample_actions_copred. Needs a copred checkpoint (--config-name pi05_base_copred).
+    ap.add_argument("--schedule", default=None, choices=["s1", "s2", "s3"],
+                    help="M10: s1 intent-first (the method), s2 joint, s3 action-first control")
+    ap.add_argument("--num-intent-steps", type=int, default=4, help="M10: K_I Euler steps for the intent phase")
+    ap.add_argument("--copred-mask", default=None, choices=["j", "t", "b1", "xattn"],
+                    help="M10: override the config's suffix mask variant to match how the checkpoint "
+                         "was trained (C1: t; B1 adaLN0: b1; gated cross-attn: xattn) -- "
+                         "--config-name alone always builds the default 'j' architecture")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -111,6 +141,10 @@ def main():
 
     # ---- load policy ----
     train_config = _config.get_config(args.config_name)
+    if args.copred_mask:
+        import dataclasses
+        train_config = dataclasses.replace(
+            train_config, model=dataclasses.replace(train_config.model, copred_mask=args.copred_mask))
     norm_stats = None
     if args.norm_stats_from_config:
         from openpi.training import checkpoints as _checkpoints
@@ -119,6 +153,17 @@ def main():
     policy = _policy_config.create_trained_policy(train_config, args.checkpoint_dir, norm_stats=norm_stats)
     if args.fp32 and not args.frozen_base_weights:
         policy._model = policy._model.float()  # pi05_base overflows bf16 -> fp32 forward (ALL paths)
+    if args.schedule:
+        # M10: swap the sampler for the co-prediction schedule driver; the rest of the policy
+        # pipeline (transforms, normalization, chunking) is untouched.
+        import functools
+        assert int(getattr(policy._model, "copred_h", 0)) > 0, \
+            "--schedule requires a co-prediction checkpoint (config with copred_h > 0)"
+        policy._sample_actions = functools.partial(
+            policy._model.sample_actions_copred,
+            schedule=args.schedule, num_intent_steps=args.num_intent_steps)
+        print(f"[M10] sampling via sample_actions_copred schedule={args.schedule} "
+              f"K_I={args.num_intent_steps}", flush=True)
 
     # ---- optional intent generator (MIP flow map sidecar) ----
     gen = None
@@ -214,7 +259,8 @@ def main():
 
     results = {}
     total_ep, total_succ = 0, 0
-    for task_id in range(n_tasks):
+    task_ids = range(n_tasks) if args.tasks is None else [int(x) for x in args.tasks.split(",")]
+    for task_id in task_ids:
         task = suite.get_task(task_id)
         init_states = suite.get_task_init_states(task_id)
         bddl = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
@@ -229,8 +275,10 @@ def main():
             obs = env.set_init_state(init_states[ep % len(init_states)])
             plan = collections.deque()
             win = collections.deque(maxlen=obs_steps)
+            record = args.video_dir is not None and ep < args.videos_per_task
+            frames = [] if record else None
             done = False
-            for t in range(MAX_STEPS + NUM_STEPS_WAIT):
+            for t in range(MAX_STEPS_BY_SUITE.get(args.task_suite, 300) + NUM_STEPS_WAIT):
                 if t < NUM_STEPS_WAIT:
                     obs, _, done, _ = env.step(LIBERO_DUMMY_ACTION)
                     continue
@@ -262,10 +310,17 @@ def main():
                     action_chunk = np.asarray(policy.infer(element)["actions"])
                     plan.extend(action_chunk[: args.replan_steps])
                 obs, _, done, _ = env.step(plan.popleft().tolist())
+                if record:
+                    frames.append(_video_frame(obs))
                 if gen is not None:  # keep the obs window fresh between replans
                     win.append(mip_obs(obs))
                 if done:
                     break
+            if record:
+                vdir = pathlib.Path(args.video_dir)
+                vdir.mkdir(parents=True, exist_ok=True)
+                tag = "succ" if done else "fail"
+                _save_video(str(vdir / f"{args.task_suite}_t{task_id}_ep{ep}_{tag}.mp4"), frames)
             t_ep += 1
             t_succ += int(done)
             total_ep += 1
