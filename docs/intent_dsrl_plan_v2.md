@@ -1,5 +1,9 @@
 # Intent as a Steering Interface — Execution Plan v2.2
 
+> **SUPERSEDED 2026-08-04 by `intent_dsrl_plan_v3.md`** (RoboCasa-first B0/B1 from-scratch
+> program; pi0.5 finetuning line closed). Kept for history; the statistics/labeling discipline
+> and gate fail-routing defined here carry forward into v3.
+
 **Date:** 2026-08-03. Supersedes the sequencing in `intent_dsrl_robocasa_plan.md` (v1, kept as the
 reference for motivation/formulation). Branch: `copredict`.
 
