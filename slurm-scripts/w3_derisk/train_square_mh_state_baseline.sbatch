@@ -10,12 +10,14 @@
 mkdir -p logs
 source /home/ldahiya/max_vla/much-ado-about-noising/.venv/bin/activate
 cd /home/ldahiya/max_vla/much-ado-about-noising
+export HF_HOME=/data/user_data/ldahiya/hf_cache
 
 # W3 step 0: Plain flow BC baseline on square-mh-state.
 # Target SR: ~30-70% (difficulty-matched for control ladder).
 # Rollouts are ~1000x cheaper than RoboCasa; evaluate at 30-70% for fair comparison.
 
 python examples/train/train_robomimic.py \
+    --config-path /home/ldahiya/max_vla/much-ado-about-noising/examples/configs \
     task=square_mh_state \
     network=mlp \
     optimization.gradient_steps=300000 \

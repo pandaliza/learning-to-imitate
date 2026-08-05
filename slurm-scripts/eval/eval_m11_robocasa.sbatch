@@ -54,7 +54,7 @@ python examples/openpi/eval_robocasa_intent.py \
     ${TASKS:+--tasks "$TASKS"} \
     ${VIDDIR:+--save-video-dir "$VIDDIR"} \
     --num-trials-per-task $TRIALS \
-    --schedule "$SCHEDULE" \
+    $([ "$SCHEDULE" != standard ] && echo --schedule "$SCHEDULE") \
     --num-intent-steps ${KI:-4} \
     --out "$OUT"
 

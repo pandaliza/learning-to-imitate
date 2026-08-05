@@ -10,6 +10,7 @@
 mkdir -p logs
 source /home/ldahiya/max_vla/much-ado-about-noising/.venv/bin/activate
 cd /home/ldahiya/max_vla/much-ado-about-noising
+export HF_HOME=/data/user_data/ldahiya/hf_cache
 
 # W3 step 0: Flow-intent BC (Config A) on square-mh-state.
 # Architecture:
@@ -22,6 +23,7 @@ cd /home/ldahiya/max_vla/much-ado-about-noising
 # Target SR: ~30-70% (same as baseline for fair comparison).
 
 python examples/train/train_robomimic.py \
+    --config-path /home/ldahiya/max_vla/much-ado-about-noising/examples/configs \
     task=square_mh_state_flow_intent \
     network=mlp_flow_intent \
     optimization.gradient_steps=300000 \
