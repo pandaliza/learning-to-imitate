@@ -289,18 +289,7 @@ class RoboCasaEnvAdapter:
         if info is not None and "success" in info:
             return bool(info["success"])
 
-        # RoboCasa envs expose _check_success(), not is_success() — checking only
-        # the latter is what scored the entire Phase-A grid 0/900 (see
-        # docs/robocasa_m11/eval_zero_debug_report.md).
-        if hasattr(self.env, "_check_success"):
-            try:
-                return bool(self.env._check_success())
-            except Exception:
-                pass
-
-        # RoboCasa envs expose _check_success(), not is_success(); checking only
-        # is_success() is what scored the Phase-A grid 0/900 (see
-        # docs/robocasa_m11/eval_zero_debug_report.md).
+        # RoboCasa/robosuite envs expose success via the private _check_success()
         if hasattr(self.env, "_check_success"):
             try:
                 return bool(self.env._check_success())
