@@ -1,0 +1,5 @@
+task_name,delta_m,n_valid_cases,n_matched_trials,n_reset_families,succ_A,succ_I,sr_A,sr_I,gap_I_minus_A
+square_mh_state,0.0,50,150,50,69,65,0.460,0.433,-0.027
+square_mh_state,0.02,500,1500,50,627,631,0.418,0.421,0.003
+square_mh_state,0.05,500,1500,50,378,422,0.252,0.281,0.029
+square_mh_state,0.1,500,1500,50,81,103,0.054,0.069,0.015

@@ -1,0 +1,5 @@
+task_name,delta_m,attempted_cases,valid_cases,invalid_cases,unknown_cases,matched_valid_trials,matched_invalid_trials,matched_unknown_trials,valid_successes_A,valid_successes_I,invalid_successes_A,invalid_successes_I,unknown_successes_A,unknown_successes_I,infra_errors_A,infra_errors_I,policy_failures_A,policy_failures_I,missing_A,missing_I,unpaired_excluded
+square_mh_state,0.0,50,50,0,0,150,0,0,69,65,0,0,0,0,0,0,0,0,0,0,0
+square_mh_state,0.02,500,500,0,0,1500,0,0,627,631,0,0,0,0,0,0,0,0,0,0,0
+square_mh_state,0.05,500,500,0,0,1500,0,0,378,422,0,0,0,0,0,0,0,0,0,0,0
+square_mh_state,0.1,500,500,0,0,1500,0,0,81,103,0,0,0,0,0,0,0,0,0,0,0

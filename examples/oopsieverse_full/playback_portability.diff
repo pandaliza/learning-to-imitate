@@ -1,0 +1,31 @@
+--- /edrive1/lizad/oopsieverse_full_study/src/oopsieverse/scripts/playback_robocasa.py	2026-10-06 03:57:33.041337119 +0000
++++ playback_robocasa_portable.py	2026-10-06 04:03:17.254775370 +0000
+@@ -28,7 +28,9 @@
+ matplotlib.use("Agg")  # non-GUI backend
+ from collections import defaultdict
+ 
+-_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++# [PORTABILITY] this copy lives outside the oopsieverse checkout; point at the pinned clone.
++_project_root = os.environ.get("OOPSIEVERSE_ROOT", "/edrive1/lizad/oopsieverse_full_study/src/oopsieverse")
++from path_remap import remap_asset_paths  # [PORTABILITY] path-only rewrite of collector paths
+ sys.path.insert(0, _project_root)
+ sys.path.insert(1, os.path.join(_project_root, "oopsiebench"))
+ 
+@@ -192,7 +194,7 @@
+     )
+ 
+     demo_grp = src_f[f"data/{demo_name}"]
+-    ep_meta = json.loads(demo_grp.attrs.get("ep_meta", "{}"))
++    ep_meta = json.loads(remap_asset_paths(demo_grp.attrs.get("ep_meta", "{}")))  # [PORTABILITY]
+     if ep_meta:
+         env.set_ep_meta(ep_meta)
+     else:
+@@ -202,7 +204,7 @@
+ 
+     # ── Restore exact model if stored ──
+     if "model_file" in demo_grp.attrs:
+-        model_xml = demo_grp.attrs["model_file"]
++        model_xml = remap_asset_paths(demo_grp.attrs["model_file"])  # [PORTABILITY]
+         env.reset_from_xml_string(model_xml)
+         env.sim.reset()
+ 

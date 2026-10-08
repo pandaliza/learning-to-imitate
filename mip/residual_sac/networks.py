@@ -72,7 +72,7 @@ class TanhGaussianPolicy(nn.Module):
 
     def forward(self, obs: torch.Tensor) -> TransformedDistribution:
         h = self.trunk(obs)
-        mean = self.mean_head(h)
+        mean = self.mean_head(h).clamp(-10.0, 10.0)
         log_std = self.log_std_head(h).clamp(self.log_std_min, self.log_std_max)
         std = log_std.exp()
 

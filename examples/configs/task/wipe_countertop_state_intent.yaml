@@ -1,0 +1,12 @@
+# @package task
+defaults:
+  - wipe_countertop_state
+  - _self_
+
+# Mean future eef pose over the next intent_horizon steps, appended to obs.
+# The learned predictor supplies it at eval; oracle and constant-velocity variants are also scored.
+intent_conditioning: true
+intent_dim: 7
+intent_type: "mean"
+intent_horizon: 8
+intent_predictor: true

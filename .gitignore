@@ -240,3 +240,4 @@ external/DynaFLIP/
 figures/*
 !figures/sr_m8.png
 !figures/sr_m9.png
+oops_runs/

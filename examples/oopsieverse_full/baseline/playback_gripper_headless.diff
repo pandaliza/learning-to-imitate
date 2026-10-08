@@ -1,0 +1,17 @@
+--- playback_robocasa_portable.py
++++ playback_robocasa_portable.py (+gripper, +headless; as executed by baseline/playback_official.py)
+@@ -353,11 +353,13 @@
+                 return
+         print(f"Found demos: {demos}\n")
+ 
++        from damagesim.robosuite.io_utils import patch_gripper_for_position_control  # [GRIPPER]
++        patch_gripper_for_position_control()  # [GRIPPER] collection-time continuous gripper (teleop_robocasa.py:656-658,1047)
+         env = env_config.damageable_class(
+             robots=env_config.robot,
+             controller_configs=load_composite_controller_config(robot=env_config.robot),
+             translucent_robot=False,
+-            has_renderer=True,
++            has_renderer=False,  # [HEADLESS] onscreen viewer needs X11; offscreen EGL unchanged
+             has_offscreen_renderer=True,
+             render_camera=env_config.camera_name,
+             ignore_done=True,

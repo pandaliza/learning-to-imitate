@@ -1,3 +1,6 @@
 [submodule "external/openpi"]
 	path = external/openpi
 	url = https://github.com/Physical-Intelligence/openpi.git
+[submodule "external/OGPO"]
+	path = external/OGPO
+	url = https://github.com/pandaliza/OGPO.git

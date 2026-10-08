@@ -1,0 +1,82 @@
+# Intent selection, square-mh-state, SMOKE (engineering check, no scientific conclusion).
+# Template: docs/intent_selection_experiment_spec.md §12. All values resolved from the repo
+# (outputs/intent_selection/audit/resolved_semantics.json, rollout_audit.md, restoration_report.md).
+experiment_id: intent_selection_square_mh_v1
+phase: smoke
+seed_range_phase: smoke          # parent seeds 100000.., reserves 150000.. (harness.PHASE_SEED_RANGES)
+task: square-mh-state
+checkpoints:
+  action: /scr/lizad/personal/learning-to-imitate/checkpoints/square_mh_state_flow_mlp_512_h10_seed0_success62.pt
+  intent: /scr/lizad/personal/learning-to-imitate/checkpoints/square_mh_state_flow_mlp_512_h10_seed0_intent_flow_intent_success64.pt
+checkpoint_sha256:
+  action: 60c535557416d7346630dbfa54d08d9c709b6b24f00ff5a3b4e87e474e3460f7
+  intent: 651de8ab8457ed9a92e82b389d6ec1a59ce89fda1b318e1287e8b93d5b0000de
+checkpoint_training_step: {action: 49999, intent: 189999}
+checkpoint_training_seed: {action: 0, intent: 0}   # from checkpoint file names (seed0)
+checkpoint_pair_id: seed_pair_0
+hydra_overrides:
+  action: [task=square_mh_state, network=mlp]
+  intent: [task=square_mh_state_flow_intent, network=mlp_flow_intent]
+freeze_models: true
+use_ema: true
+sampling: native_prior
+task_config_source: checkpoint_and_native_eval
+arms:
+  ACTION_STOCH:
+    checkpoint: action
+    sample_mode: stochastic
+    native: false
+    note: >-
+      ACTION checkpoint with Gaussian initial noise (N(0,I), shape (10,10)). NON-NATIVE: the
+      checkpoint's native sample mode is 'zero' (deterministic), which would give 16 identical
+      candidates. User decision.
+  INTENT:
+    checkpoint: intent
+    sample_mode: native_intent_noise
+    native: true
+    decoder: deterministic_mlp
+    decoder_seed: null            # MLP decoder has no noise; decoder_seed recorded as -1
+    note: native intent-flow noise N(0,I), shape (1,7); deterministic MLP action decoder
+obs_dim: 23
+obs_steps: 2
+prediction_horizon: 10
+execution_horizon: 8             # H_exec, both arms (task.act_steps)
+episode_horizon: 400             # T, native max_episode_steps
+nfe: 9
+inference:
+  device: cpu
+  torch_threads: 1
+  float32_matmul_precision: highest   # deviation from native "high" (TF32 batch dependence)
+  candidate_batch_size: 1
+candidate_pool_size: 3
+report_k: [1, 3]
+continuation_mode: native
+tail_modes: [native]
+continuation_replicates: 2       # confirmation: 4
+state_bank:
+  parent_resets: 2
+  reserve_parents: 4
+  strata: [reset, mid]
+  mid_source_mix: {ACTION_STOCH: 0.5, INTENT: 0.5}
+  mid_time_fraction: [0.2, 0.6]
+  mid_states_per_parent: 1
+  reject_already_successful: true
+  reserves_contribute: [mid]     # reserve parents only top up the MID stratum
+  split_unit: parent_reset_id
+  split: dev
+  selection_uses_branch_outcomes: false
+analysis:
+  primary_stratum: mid
+  primary_k: 3
+  subset_samples_k4: 128
+  bootstrap_unit: parent_reset_id
+  bootstrap_resamples: 200
+  practical_effect_threshold: 0.05
+runtime:
+  max_env_steps: 60000
+  max_wall_hours: 1
+  num_workers: 8
+  job_order_seed: null
+  resume: true
+  deterministic_job_ids: true
+  render_all_rollouts: false

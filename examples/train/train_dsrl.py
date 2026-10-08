@@ -103,8 +103,17 @@ def _run_flow(
     noise_batch: np.ndarray,
     config: Config,
     device: str,
+    flow_num_steps: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the frozen flow agent with injected noise.
+
+    Args:
+        flow_num_steps: ODE integration steps (NFE) for the frozen policy. -1 falls
+            back to config.optimization.num_steps, which defaults to 1 — a single
+            Euler step that cripples the base policy (measured on the square-mh
+            flow-intent checkpoint: SR 0.03 at NFE=1 vs 0.50 at NFE=9). Always set
+            this to the NFE the checkpoint was evaluated at, or DSRL steers a base
+            policy far weaker than the one the checkpoint's SR was reported for.
 
     Returns:
         obs_tensor: (num_envs, obs_steps, obs_dim) — for SAC obs_flat computation
@@ -118,7 +127,9 @@ def _run_flow(
         intent_noise = torch.tensor(
             noise_batch.reshape(num_envs, 1, intent_dim), device=device, dtype=torch.float32
         )
-        a_exec_norm = flow_agent.sample_with_intent_noise(obs_tensor, intent_noise, use_ema=True)
+        a_exec_norm = flow_agent.sample_with_intent_noise(
+            obs_tensor, intent_noise, use_ema=True, num_steps=flow_num_steps
+        )
     else:
         Ta = config.task.horizon
         act_dim = config.task.act_dim
@@ -127,7 +138,8 @@ def _run_flow(
         )
         with torch.no_grad():
             a_exec_norm = flow_agent.sample(
-                act_0=act_0, obs=obs_tensor, use_ema=True, sample_mode="stochastic"
+                act_0=act_0, obs=obs_tensor, use_ema=True, sample_mode="stochastic",
+                num_steps=flow_num_steps,
             )
 
     return obs_tensor, a_exec_norm
@@ -142,7 +154,17 @@ def evaluate(
     config: Config,
     noise_dim: int,
     num_episodes: int = 10,
+    flow_num_steps: int = -1,
+    use_prior_noise: bool = False,
 ) -> dict[str, float]:
+    """Roll out the frozen policy under DSRL-chosen noise.
+
+    Args:
+        use_prior_noise: ignore the actor and draw z ~ N(0, I) instead. This is the
+            unsteered base-policy baseline measured through the *same* harness, so
+            "did steering help?" is answered against a like-for-like number rather
+            than an SR reported elsewhere under a different eval path/NFE.
+    """
     dsrl.eval()
     num_envs = config.task.num_envs
     episode_rewards, episode_success = [], []
@@ -157,13 +179,18 @@ def evaluate(
             obs_norm = dataset.normalizer["obs"]["state"].normalize(obs_raw.astype(np.float32))
             obs_flat = _flatten(obs_norm)
 
-            all_noise = []
-            for ei in range(num_envs):
-                noise, _ = dsrl.sample_noise(obs_flat[ei], deterministic=True)
-                all_noise.append(noise)
-            noise_batch = np.stack(all_noise)
+            if use_prior_noise:
+                noise_batch = np.random.randn(num_envs, noise_dim).astype(np.float32)
+            else:
+                all_noise = []
+                for ei in range(num_envs):
+                    noise, _ = dsrl.sample_noise(obs_flat[ei], deterministic=True)
+                    all_noise.append(noise)
+                noise_batch = np.stack(all_noise)
 
-            _, a_exec_norm = _run_flow(flow_agent, is_flow_intent, obs_norm, noise_batch, config, device)
+            _, a_exec_norm = _run_flow(
+                flow_agent, is_flow_intent, obs_norm, noise_batch, config, device, flow_num_steps
+            )
 
             start = config.task.obs_steps - 1
             chunk_norm = a_exec_norm[:, start:start + act_steps, :]
@@ -244,6 +271,9 @@ def main(raw_cfg: DictConfig) -> None:
         noise_mag=dsrl_cfg.get("noise_mag", 2.0),
         backup_entropy=dsrl_cfg.get("backup_entropy", True),
         q_target_clip=float(dsrl_cfg.get("q_target_clip", float("inf"))),
+        actor_type=dsrl_cfg.get("actor_type", "tanh"),
+        kl_beta=float(dsrl_cfg.get("kl_beta", 0.1)),
+        warmup_dist=dsrl_cfg.get("warmup_dist", "uniform"),
         device=device,
     )
     target_entropy = dsrl_cfg.get("target_entropy", "auto")
@@ -269,6 +299,11 @@ def main(raw_cfg: DictConfig) -> None:
 
     total_env_steps = dsrl_cfg.get("total_env_steps", 1_000_000)
     warmup_steps = dsrl_cfg.get("warmup_steps", 1000)
+    # NFE for the frozen policy's ODE. config.optimization.num_steps defaults to 1,
+    # which measures ~0.03 SR on checkpoints whose reported SR was taken at NFE 9 —
+    # set this to the checkpoint's eval NFE so DSRL steers the policy we think it does.
+    flow_num_steps = int(dsrl_cfg.get("flow_num_steps", 9))
+    loguru.logger.info(f"Frozen-policy ODE steps (NFE): {flow_num_steps}")
     batch_size = dsrl_cfg.get("batch_size", 256)
     num_updates = dsrl_cfg.get("num_updates_per_step", 1)
     reward_scale = dsrl_cfg.get("reward_scale", 1.0)
@@ -292,21 +327,54 @@ def main(raw_cfg: DictConfig) -> None:
 
     loguru.logger.info(f"Starting DSRL training for {total_env_steps} env steps")
 
+    # --- Step-0 eval, before any gradient update ---
+    # The first scheduled eval lands at ~eval_freq, by which point the actor has
+    # already taken thousands of updates. For actor_type="mean_shift" the mean head
+    # is zero-init, so at step 0 the steered policy IS the base policy (gain == 0) —
+    # that invariant is only observable here, and it is the cheapest check that the
+    # injection path and eval harness agree.
+    _m0 = evaluate(dsrl, flow_agent, is_flow_intent, envs, dataset, config,
+                   noise_dim=noise_dim, num_episodes=eval_episodes,
+                   flow_num_steps=flow_num_steps)
+    _p0 = evaluate(dsrl, flow_agent, is_flow_intent, envs, dataset, config,
+                   noise_dim=noise_dim, num_episodes=eval_episodes,
+                   flow_num_steps=flow_num_steps, use_prior_noise=True)
+    _m0["eval/prior_mean_success"] = _p0["eval/mean_success"]
+    _m0["eval/prior_mean_reward"] = _p0["eval/mean_reward"]
+    _m0["eval/steering_gain"] = _m0["eval/mean_success"] - _p0["eval/mean_success"]
+    _m0["step"] = 0
+    logger.log(_m0, category="eval")
+    loguru.logger.info(
+        f"Step 0: success={_m0['eval/mean_success']:.2f}, "
+        f"reward={_m0['eval/mean_reward']:.2f} | "
+        f"prior={_p0['eval/mean_success']:.2f} "
+        f"gain={_m0['eval/steering_gain']:+.2f}  (untrained actor)"
+    )
+    obs_raw, _ = envs.reset()
+    obs_norm = dataset.normalizer["obs"]["state"].normalize(obs_raw.astype(np.float32))
+    obs_flat = _flatten(obs_norm)
+
     while global_step < total_env_steps:
         # --- Sample noise from actor (or random during warmup) ---
         all_noise = []
         for ei in range(config.task.num_envs):
             if global_step < warmup_steps:
-                noise = np.random.uniform(
-                    -dsrl_config.noise_mag, dsrl_config.noise_mag, size=(noise_dim,)
-                ).astype(np.float32)
+                if dsrl_config.warmup_dist == "gaussian":
+                    # Match the frozen flow policy's training prior z ~ N(0, I).
+                    noise = np.random.randn(noise_dim).astype(np.float32)
+                else:
+                    noise = np.random.uniform(
+                        -dsrl_config.noise_mag, dsrl_config.noise_mag, size=(noise_dim,)
+                    ).astype(np.float32)
             else:
                 noise, _ = dsrl.sample_noise(obs_flat[ei])
             all_noise.append(noise)
         noise_batch = np.stack(all_noise)  # (num_envs, noise_dim)
 
         # --- Run frozen flow policy with injected noise ---
-        _, a_exec_norm = _run_flow(flow_agent, is_flow_intent, obs_norm, noise_batch, config, device)
+        _, a_exec_norm = _run_flow(
+            flow_agent, is_flow_intent, obs_norm, noise_batch, config, device, flow_num_steps
+        )
 
         start = obs_steps - 1
         chunk_norm = a_exec_norm[:, start:start + act_steps, :].cpu().numpy()
@@ -372,12 +440,27 @@ def main(raw_cfg: DictConfig) -> None:
             eval_metrics = evaluate(
                 dsrl, flow_agent, is_flow_intent, envs, dataset, config,
                 noise_dim=noise_dim, num_episodes=eval_episodes,
+                flow_num_steps=flow_num_steps,
+            )
+            # Unsteered baseline through the same harness: the honest reference for
+            # "did steering help?", immune to NFE/eval-path drift between codepaths.
+            prior_metrics = evaluate(
+                dsrl, flow_agent, is_flow_intent, envs, dataset, config,
+                noise_dim=noise_dim, num_episodes=eval_episodes,
+                flow_num_steps=flow_num_steps, use_prior_noise=True,
+            )
+            eval_metrics["eval/prior_mean_success"] = prior_metrics["eval/mean_success"]
+            eval_metrics["eval/prior_mean_reward"] = prior_metrics["eval/mean_reward"]
+            eval_metrics["eval/steering_gain"] = (
+                eval_metrics["eval/mean_success"] - prior_metrics["eval/mean_success"]
             )
             eval_metrics["step"] = global_step
             logger.log(eval_metrics, category="eval")
             loguru.logger.info(
                 f"Step {global_step}: success={eval_metrics['eval/mean_success']:.2f}, "
-                f"reward={eval_metrics['eval/mean_reward']:.2f}"
+                f"reward={eval_metrics['eval/mean_reward']:.2f} | "
+                f"prior={prior_metrics['eval/mean_success']:.2f} "
+                f"gain={eval_metrics['eval/steering_gain']:+.2f}"
             )
             if eval_metrics["eval/mean_success"] > best_success:
                 best_success = eval_metrics["eval/mean_success"]

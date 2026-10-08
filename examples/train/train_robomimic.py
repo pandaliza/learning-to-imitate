@@ -96,7 +96,7 @@ def _get_sim_state(env) -> np.ndarray | None:
 
 
 def train(config: Config, envs, dataset, agent, logger, resume_state=None,
-          intent_predictor=None, intent_encoder=None):
+          intent_predictor=None, intent_encoder=None, eval_fn=None):
     """Standalone training function.
 
     Args:
@@ -109,7 +109,9 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
         intent_predictor: Optional IntentPredictor trained jointly with the policy
         intent_encoder: Optional IntentEncoder (only for encoded_mean, Config B).
             Co-trained with intent_predictor; its params are added to the same optimizer.
+        eval_fn: Optional replacement for env-rollout `eval` with the same signature.
     """
+    eval_fn = eval_fn or eval
     # dataloader
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -491,8 +493,8 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
             else:
                 num_steps_list = get_default_step_list(config.optimization.loss_type)
             for num_steps in num_steps_list:
-                metrics.update(eval(config, envs, dataset, agent, logger, num_steps,
-                                    intent_predictor=intent_predictor))
+                metrics.update(eval_fn(config, envs, dataset, agent, logger, num_steps,
+                                       intent_predictor=intent_predictor))
 
             # Update best metrics and average metrics
             old_best_metrics = best_metrics.copy()

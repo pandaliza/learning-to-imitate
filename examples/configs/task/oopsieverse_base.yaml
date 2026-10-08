@@ -1,0 +1,21 @@
+# @package task
+# OopsieVerse RoboCasa teleop demos (state only; no simulator for rollout eval).
+defaults:
+  - _self_
+
+obs_type: "state"
+env_type: "teleop"
+abs_action: false  # 12-dim delta actions: 6-DoF eef delta, gripper, 5 base/torso dims (held constant)
+
+# Trains on both feedback conditions; the last 10% of demos in each is held out for offline eval.
+conditions: ["without_live_feedback", "with_live_feedback"]
+val_dataset_percentage: 0.1
+
+obs_keys: ["object-state", "robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos"]
+obs_dim: 23  # 14 + 3 + 4 + 2; recomputed from the dataset at startup
+act_dim: 12
+obs_steps: 2
+act_steps: 8
+horizon: 16
+num_envs: 1
+save_video: false

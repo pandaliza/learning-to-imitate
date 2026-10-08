@@ -31,6 +31,10 @@ register_codecs()
 
 
 def make_dataset(task_config, mode="train"):
+    if task_config.env_name in ("pick_egg", "wipe_countertop"):
+        from mip.datasets.oopsieverse_dataset import make_dataset as make_oopsieverse_dataset
+        return make_oopsieverse_dataset(task_config, mode=mode)
+
     # Check if we should download from HuggingFace
     if hasattr(task_config, "dataset_repo") and hasattr(
         task_config, "dataset_filename"

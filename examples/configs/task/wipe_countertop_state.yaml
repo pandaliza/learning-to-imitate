@@ -1,0 +1,6 @@
+# @package task
+defaults:
+  - oopsieverse_base
+  - _self_
+
+env_name: "wipe_countertop"

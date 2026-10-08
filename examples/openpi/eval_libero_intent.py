@@ -28,6 +28,7 @@ import functools
 import json
 import math
 import pathlib
+import sys
 
 import numpy as np
 import torch
@@ -131,6 +132,12 @@ def main():
                          "was trained (C1: t; B1 adaLN0: b1; gated cross-attn: xattn) -- "
                          "--config-name alone always builds the default 'j' architecture")
     ap.add_argument("--device", default="cuda")
+    # Parity hooks for examples/openpi/oops (off by default; native behaviour unchanged when unset).
+    ap.add_argument("--episode-seeding", type=int, default=None, metavar="POLICY_SEED",
+                    help="seed np/torch/JAX policy rng per episode exactly as oops/eval_spatial_shifts.py does "
+                         "for the delta=0 case of reset `ep`")
+    ap.add_argument("--dump-actions", default=None,
+                    help="dir: save per-replan action chunks per episode (oops parity check)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -271,6 +278,12 @@ def main():
             pass
         t_ep, t_succ = 0, 0
         for ep in range(args.num_trials_per_task):
+            if args.episode_seeding is not None:
+                sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "oops"))
+                import oops_common as _oc
+                _oc.seed_everything(_oc.episode_seed(str(task.language).strip().lower(), ep % len(init_states),
+                                                     0.0, -1, args.episode_seeding), policy)
+            dump = [] if args.dump_actions else None
             env.reset()
             obs = env.set_init_state(init_states[ep % len(init_states)])
             plan = collections.deque()
@@ -308,6 +321,9 @@ def main():
                     if vl is not None:
                         element["intent"] = vl(element)
                     action_chunk = np.asarray(policy.infer(element)["actions"])
+                    if dump is not None:
+                        dump.append({"t": t, "actions": action_chunk.copy(), "intent": element.get("intent"),
+                                     "state": element["observation/state"].copy()})
                     plan.extend(action_chunk[: args.replan_steps])
                 obs, _, done, _ = env.step(plan.popleft().tolist())
                 if record:
@@ -321,6 +337,13 @@ def main():
                 vdir.mkdir(parents=True, exist_ok=True)
                 tag = "succ" if done else "fail"
                 _save_video(str(vdir / f"{args.task_suite}_t{task_id}_ep{ep}_{tag}.mp4"), frames)
+            if dump is not None:
+                ddir = pathlib.Path(args.dump_actions) / "native"
+                ddir.mkdir(parents=True, exist_ok=True)
+                slug = str(task.language).strip().lower().replace(" ", "_")
+                np.save(ddir / f"{slug}_r{ep % len(init_states)}_d0.000_a-1_s{args.episode_seeding}.npy",
+                        np.array(dump + [{"done": bool(done), "steps": t + 1 - NUM_STEPS_WAIT}], dtype=object),
+                        allow_pickle=True)
             t_ep += 1
             t_succ += int(done)
             total_ep += 1
