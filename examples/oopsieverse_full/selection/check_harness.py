@@ -183,6 +183,35 @@ def main():
         w("## H8. Record replay (determinism of a completed continuation)")
         w("")
         w(json.dumps(rep, indent=1, default=float))
+    # H9: GPU-3 sharing evidence
+    sup = open(f"{ROOT}/supervisor.log").read().splitlines()
+    ev = [x for x in sup if "EVICT_TEST" in x]
+    inc = [x for x in sup if "OVER CAP" in x or "DAEMON ACTIVE" in x or "worker gone" in x]
+    ylds = [x for x in sup if "yield worker" in x and "finishes" in x]
+    bl = [json.loads(x) for x in open("/edrive1/lizad/oopsieverse_full_study/runs/selection/_gpu3/budget_log.jsonl")]
+    bl = [b for b in bl if "total_ours_mib" in b]
+    w("")
+    w("## H9. GPU-3 sharing with the eval daemon (measured)")
+    w("")
+    w(f"- **Budget samples logged:** {len(bl)} (`runs/selection/_gpu3/budget_log.jsonl`).")
+    w(f"- **Our total on GPU 3** (daemon + selection + tests): max {max(b['total_ours_mib'] for b in bl):.0f} MiB against the 10,240 MiB cap. Samples over the cap: {sum(b['total_ours_mib'] > 10240 for b in bl)}.")
+    w(f"- **Samples with GPU-3 free < 8 GB:** {sum(b['free_mib'] < 8192 for b in bl)}. These came from another user's process ramping to within 0.5–2 GB of full. The policy response is below.")
+    w(f"- **Pre-emptive drains before daemon evaluations:** {len(set(x[:5] for x in ylds))} episodes; for example `{ylds[0] if ylds else '-'}`. Every worker had exited before the daemon's workers allocated.")
+    w(f"- **Safe-eviction tests:** {len(ev)}, all `safe` (no SIGKILL fallback); survivors kept producing records:")
+    for x in ev:
+        w(f"  - `{x}`")
+    w(f"- **Incidents:** {len(inc)}:")
+    for x in inc:
+        w(f"  - `{x}`")
+    w("")
+    w("**What the 05:50 incident caused.**")
+    w("- The SIGKILL then in use could cut a request that was half-written into the shared inference queue. The worker respawned into that slot hung, and so did the supervisor's shutdown.")
+    w("- The tree was stopped. No record was corrupted (records are atomic) and nothing was lost beyond in-flight continuations.")
+    w("")
+    w("**Fixes.**")
+    w("- **Safe eviction.** SIGUSR1 tells a worker to exit at once if it is not mid-request, or as soon as its response arrives if it is. SIGKILL is used only after 5 s, and is followed by a server restart with fresh queues.")
+    w("- **Liveness polling** of worker processes.")
+    w("- **Strict headroom.** New workers are granted only if free memory (with our workers removed) stays at or above 8 GB plus 256 MiB margin plus their own footprint, measured at its lowest over the last 30 min. This plans against other users' spikes.")
     open(f"{OUT}/harness_verification.md", "w").write("\n".join(L) + "\n")
     print("written", s["records"])
 

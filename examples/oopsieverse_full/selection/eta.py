@@ -17,7 +17,8 @@ import numpy as np
 
 STUDY = "/scr/lizad/personal/learning-to-imitate/outputs/oopsieverse_full_study"
 ROOT = "/edrive1/lizad/oopsieverse_full_study/runs/selection/pick_egg/sel_dev_parents/train_seed_0"
-WORKERS = 8
+WORKERS = int(os.environ.get("OV_ETA_WORKERS", 8))
+TAG = os.environ.get("OV_ETA_TAG", "")
 M, R = 16, 4
 
 
@@ -39,14 +40,17 @@ def main():
              if v.get("progress") and v["progress"].get("updates_per_s")]
     total_rate = float(np.sum(rates)) if rates else 4.0       # updates/s summed over all training jobs (GPUs 0, 1, 4)
     runs_per_h = total_rate * 3600 / 30000
-    busy = min(1.0, runs_per_h * (ev_h + 8 / 60))             # daemon evaluating + pre-emptive drain
-    duty = max(0.0, 1 - busy)
     done = set(r for q in qs for r in q.get("done", []))
     n_total = max(q["n_total"] for q in qs)
     n_pending_train = n_total - len(done)
     train_left_h = n_pending_train / max(runs_per_h, 1e-6)
-    eval_left_h = 0.0
+    n_evaluated = sum(1 for v in json.load(open(f"{STUDY}/matrix/eval_status.json")).get("evaluated", {}).values() if v.get("n", 0) >= 600)
+    n_uneval = n_total - n_evaluated
+    daemon_busy_h = n_uneval * (ev_h + 8 / 60)          # every remaining evaluation + its drain
+    horizon_h = max(train_left_h, daemon_busy_h)        # GPU 3 is shared until both are over
+    duty = max(0.0, 1 - daemon_busy_h / horizon_h) if horizon_h > 0 else 1.0
     cycle_h = 1 / max(runs_per_h, 1e-6)
+    eval_left_h = daemon_busy_h
     per_worker_h = 3600 / ws
     free_rate = WORKERS * per_worker_h
     eff_rate = free_rate * duty
@@ -54,7 +58,7 @@ def main():
     def eta(n, extra_states=0):
         work_h = (n * ws + extra_states * coll_s) / 3600 / WORKERS   # hours of free-GPU time
         # while the queue runs we get `duty`; afterwards (all trained + evaluated) duty = 1
-        horizon = train_left_h + eval_left_h * 0  # eval interleaves with training
+        horizon = horizon_h
         if work_h <= horizon * duty:
             return work_h / duty, work_h
         return horizon + (work_h - horizon * duty), work_h
@@ -72,7 +76,9 @@ def main():
         "worker_s_per_state_collection": coll_s,
         "gpu3_workers_when_daemon_idle": WORKERS, "continuations_per_hour_when_free": free_rate,
         "daemon_duty": {"eval_h_per_run": ev_h, "hours_between_completed_runs": cycle_h, "training_updates_per_s_total": total_rate, "free_fraction": duty,
-                        "training_runs_left": n_pending_train, "training_queue_left_h": train_left_h},
+                        "training_runs_left": n_pending_train, "training_queue_left_h": train_left_h,
+                        "runs_not_yet_evaluated": n_uneval, "daemon_busy_h_remaining": daemon_busy_h,
+                        "shared_period_h": horizon_h},
         "effective_continuations_per_hour_while_queue_runs": eff_rate,
         "dev": {"done": dev_done, "primary_target": dev_prim, "sensitivity_target": dev_sens},
         "eta_wall_h": {
@@ -92,7 +98,7 @@ def main():
                         "CPU: 8 workers + server ~ 10 cores, inside the 18-core cap (Amendment 3); GPU 3 memory is the binding cap",
                         "wipe_countertop (diagnostic) not included: episodes are ~2x longer (1250-step timeout); not measured here"],
     }
-    json.dump(out, open(f"{STUDY}/selection/throughput_eta.json", "w"), indent=1)
+    json.dump(out, open(f"{STUDY}/selection/throughput_eta{TAG}.json", "w"), indent=1)
     e = out["eta_wall_h"]
     md = f"""# Selection throughput and ETA (measured {out['measured_on']})
 
@@ -108,9 +114,9 @@ def main():
 
 ## Capacity under the current caps
 
-- **GPU 3 workers.** 8 EGL workers fit while the eval daemon is idle; 0 fit while it evaluates.
+- **GPU 3 workers (this scenario).** {WORKERS} EGL workers while the eval daemon is idle; 0 while it evaluates.
 - **Throughput.** That gives {free_rate:.0f} continuations/h when GPU 3 is free.
-- **Daemon duty cycle.** Training (all queues, summed {total_rate:.1f} updates/s) completes a run every ~{cycle_h:.1f} h. Each completed run takes ~{ev_h:.2f} h to evaluate, and each evaluation is preceded by an 8-min drain. So GPU 3 is free for about **{duty:.0%}** of wall time while the training queue runs ({n_pending_train} runs left, ~{train_left_h:.0f} h). After the queue finishes it is free 100% of the time.
+- **Daemon duty cycle.** Training (all queues, summed {total_rate:.1f} updates/s) completes a run every ~{cycle_h:.1f} h. Each completed run takes ~{ev_h:.2f} h to evaluate, and each evaluation is preceded by an 8-min drain. {n_uneval} runs still need evaluation (~{daemon_busy_h:.0f} h of daemon time) and training needs ~{train_left_h:.0f} h more, so GPU 3 is shared for the next ~{horizon_h:.0f} h and free about **{duty:.0%}** of that time. After that it is free 100% of the time.
 - **Effective rate while the queue runs.** About {eff_rate:.0f} continuations/h.
 
 ## ETA (wall clock)
@@ -124,7 +130,7 @@ def main():
 
 Test rows give the additional wall time once dev (incl. sensitivity) has finished. Total from now: dev then test primary {e['dev_all_then_test_primary_total']:.0f} h ({e['dev_all_then_test_primary_total']/24:.1f} d); dev then test primary + sensitivity {e['dev_all_then_test_all_total']:.0f} h ({e['dev_all_then_test_all_total']/24:.1f} d). Further assumptions: {'; '.join(out['assumptions'])}.
 """
-    open(f"{STUDY}/selection/throughput_eta.md", "w").write(md)
+    open(f"{STUDY}/selection/throughput_eta{TAG}.md", "w").write(md)
     print(md)
 
 

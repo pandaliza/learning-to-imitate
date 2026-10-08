@@ -40,10 +40,18 @@ def main():
     pick = [files[i] for i in rng.choice(len(files), size=min(a.n, len(files)), replace=False)]
     os.chdir(H.RE.OOPSIE)
     from ctxfix import install_ctx_free
+    rd = BW.run_dirs("pick_egg", 0)
+    # same inference path as production: a GPU-0 server process (fixed-16 batches); this process has no CUDA
+    import multiprocessing as mp
+    ctx = mp.get_context("spawn")
+    req_q, resp_q = ctx.Queue(), ctx.Queue()
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    srv = ctx.Process(target=H.inference_server, args=(rd, BW.CKPT, "cuda:0", req_q, [resp_q], None, 16))
+    srv.start()
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    dec = H.RemoteDecoder(0, req_q, resp_q)
     env = H.RE.make_env("pick_egg", use_camera_obs=False)
     install_ctx_free(env)
-    rd = BW.run_dirs("pick_egg", 0)
-    dec = H.LocalDecoder(rd, BW.CKPT, "cuda:0")
     frames = H.Frames(rd["amix"])
     out = []
     for f in pick:
@@ -63,7 +71,7 @@ def main():
 
         class D:
             def decode(self, arm_, seg, prop, x0, z):
-                return dec.decode(arm_, seg, prop, x0, z, fixed_batch=16)
+                return dec.decode(arm_, seg, prop, x0, z)
         if not ep["done"]:
             x0t, zt = H.draw_chunk_noise(gen, ai)
             ch, _i, _l = H.policy_chunk(D(), arm, frames, ep, x0t, zt)
@@ -81,7 +89,10 @@ def main():
         out.append(r)
         print(json.dumps(r), flush=True)
         json.dump(out, open(a.out, "w"), indent=1)
+    req_q.put(None)
+    srv.join(timeout=60)
 
 
 if __name__ == "__main__":
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
     main()

@@ -1,7 +1,7 @@
 """GPU-3 render budget shared with the Amendment-2 evaluation daemon (eval_runner.py, which has priority).
 
 Rules (user, 2026-10-08):
-  * our TOTAL memory on GPU 3 (eval daemon + selection workers) <= 10 GB;
+  * our TOTAL memory on GPU 3 (eval daemon + selection workers) <= 20 GB (Amendment 4; was 10 GB);
   * >= 8 GB free on GPU 3 at all times;
   * the eval daemon has priority: never starve, pause or restart it.
 
@@ -25,11 +25,14 @@ import os
 import subprocess
 import time
 
-CAP_MIB = 10 * 1024
+CAP_MIB = 10 * 1024  # Amendment 4 authorizes 20 GB, but the coexistence change below is not applied yet
 HEADROOM_MIB = 8 * 1024
 WORKER_MIB = 1150          # measured 1,084 MiB per EGL worker (matrix/arm_verification.md §8) + margin
 DAEMON_WORKERS = 9
 MARGIN_MIB = 256
+PEAK_WINDOW_S = 30 * 60     # strict headroom: plan against the lowest free memory (excluding our workers) seen recently
+HEADROOM_POLICY = os.environ.get("OV_GPU3_HEADROOM_POLICY", "strict")  # strict | reactive
+_FREE_HIST = []             # (t, free_mib + selection-worker mib), seeded from budget_log.jsonl
 LEAD_S = 8 * 60            # stop granting when a training job is predicted to finish within 8 min
 RENDER_GPU = 3
 DAEMON_PID = 1017799
@@ -154,17 +157,33 @@ def assess(our_pids, cpu_cap_workers=18):
                     if p not in our_pids and p not in daemon_set and _uid(p) == uid)
     reserve = max(daemon_mib, DAEMON_WORKERS * WORKER_MIB) if (ds["active"] or ds["imminent"]) else daemon_mib
     by_cap = int((CAP_MIB - reserve - other_mib - MARGIN_MIB) // WORKER_MIB)
-    # free memory after hypothetically freeing nothing: each extra worker consumes WORKER_MIB of `free`
-    extra_by_free = int((free - HEADROOM_MIB - MARGIN_MIB) // WORKER_MIB)
     n_now = len([p for p in our_pids if p in procs])
-    by_free = n_now + max(0, extra_by_free)
+    # headroom: free memory that would remain with our selection workers removed, now and (strict) at its
+    # lowest over the last PEAK_WINDOW_S (other users' transient spikes, e.g. a 1-min ramp to ~0.5 GB free)
+    base_now = free + ours_mib
+    now_t = time.time()
+    if not _FREE_HIST:
+        try:
+            for line in open(f"{BUDGET_DIR}/budget_log.jsonl").readlines()[-2000:]:
+                x = json.loads(line)
+                if "free_mib" in x and "ours_mib" in x and now_t - x["t"] < PEAK_WINDOW_S:
+                    _FREE_HIST.append((x["t"], x["free_mib"] + x["ours_mib"]))
+        except Exception:
+            pass
+    _FREE_HIST.append((now_t, base_now))
+    while _FREE_HIST and now_t - _FREE_HIST[0][0] > PEAK_WINDOW_S:
+        _FREE_HIST.pop(0)
+    base_plan = min(b for _, b in _FREE_HIST) if HEADROOM_POLICY == "strict" else base_now
+    by_free = int((base_plan - HEADROOM_MIB - MARGIN_MIB) // WORKER_MIB)
     granted = max(0, min(by_cap, by_free, cpu_cap_workers))
     total = daemon_mib + ours_mib + other_mib
     # the daemon became active while we hold workers: free GPU 3 at once, before its workers allocate (~10 s)
     over = total > CAP_MIB or free < HEADROOM_MIB or (ds["active"] and len(our_pids) > 0)
     d = {"t": time.time(), "time": time.strftime("%Y-%m-%d %H:%M:%S"), "free_mib": free, "daemon_mib": daemon_mib,
          "ours_mib": ours_mib, "other_user_procs_mib": other_mib, "total_ours_mib": total, "reserve_daemon_mib": reserve, "granted_workers": granted,
-         "n_workers_holding": n_now, "over_cap": over, "daemon": {k: v for k, v in ds.items() if k != "tree"},
+         "n_workers_holding": n_now, "over_cap": over, "headroom_policy": HEADROOM_POLICY,
+         "free_without_selection_now_mib": base_now, "free_without_selection_planned_mib": base_plan,
+         "peak_window_s": PEAK_WINDOW_S, "daemon": {k: v for k, v in ds.items() if k != "tree"},
          "cap_mib": CAP_MIB, "headroom_mib": HEADROOM_MIB, "worker_mib": WORKER_MIB}
     return d
 

@@ -47,6 +47,35 @@ from branch_worker import *  # noqa: E402,F401,F403
 from branch_worker import worker_main  # noqa: E402
 
 
+def safe_worker_main(*args):
+    """Transport-only wrapper (records unchanged): SIGUSR1 = leave GPU 3 now, but never in the middle of a request
+    to the shared inference server (a half-written request would wedge the server's pipe). Outside a request the
+    process exits immediately (EGL memory is released at exit); inside one it exits as soon as the response arrives."""
+    import signal as _sig
+    import harness as _H
+    state = {"in_request": False, "exit": False}
+    orig = _H.RemoteDecoder.decode
+
+    def decode(self, *a, **k):
+        state["in_request"] = True
+        try:
+            out = orig(self, *a, **k)
+        finally:
+            state["in_request"] = False
+        if state["exit"]:
+            os._exit(17)
+        return out
+    _H.RemoteDecoder.decode = decode
+
+    def on_usr1(signum, frame):
+        if state["in_request"]:
+            state["exit"] = True
+        else:
+            os._exit(17)
+    _sig.signal(_sig.SIGUSR1, on_usr1)
+    worker_main(*args)
+
+
 # ───────────────────────────── supervisor ─────────────────────────────
 
 def scan(root, parents_idx):
@@ -135,15 +164,23 @@ def supervisor(cfg, parents_idx, max_workers):
         log.write(time.strftime("%H:%M:%S ") + " ".join(str(x) for x in a) + "\n")
         log.flush()
     SLOTS = 18
-    req_q = ctx.Queue()
-    resp = [ctx.Queue() for _ in range(SLOTS)]
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    os.environ.pop("MUJOCO_EGL_DEVICE_ID", None)
     import harness as H
-    srv = ctx.Process(target=H.inference_server, args=(run_dirs(cfg["task"], cfg["train_seed"]), CKPT, "cuda:0", req_q, resp,
-                                                       f"{root}/_server_stats.json", 16))
-    srv.start()
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    srv_state = {}
+
+    def start_server():
+        """Fresh queues + a fresh GPU-0 inference server (also used after any SIGKILL fallback)."""
+        srv_state["req_q"] = ctx.Queue()
+        srv_state["resp"] = [ctx.Queue() for _ in range(SLOTS)]
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+        os.environ.pop("MUJOCO_EGL_DEVICE_ID", None)
+        srv_state["proc"] = ctx.Process(target=H.inference_server, args=(
+            run_dirs(cfg["task"], cfg["train_seed"]), CKPT, "cuda:0", srv_state["req_q"], srv_state["resp"],
+            f"{root}/_server_stats.json", 16))
+        srv_state["proc"].start()
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        L("inference server started pid", srv_state["proc"].pid)
+    start_server()
+    server_tainted = False
     res_q = ctx.Queue()
     workers = {}  # wid -> {"proc", "task_q", "stop", "unit", "parent", "t_spawn"}
     in_flight = set()
@@ -181,6 +218,10 @@ def supervisor(cfg, parents_idx, max_workers):
         cand = [u for u in pending_units() if u not in in_flight]
         if not cand:
             return False
+        def cls(u):
+            return 0 if u[0] == "collect" else (1 if u[3] == "primary" else 2)
+        top = min(cls(u) for u in cand)
+        cand = [u for u in cand if cls(u) == top]   # priority: states, then primary arms, then sensitivity
         same = [u for u in cand if u[0] == "group" and u[1] == w.get("parent")]
         u = same[0] if same else cand[0]
         in_flight.add(u)
@@ -210,6 +251,10 @@ def supervisor(cfg, parents_idx, max_workers):
         elif m["event"] == "crash":
             L("worker crash", wid, m["tb"][-2000:])
         elif m["event"] == "exit":
+            if w and w["proc"].is_alive():
+                w["proc"].join(timeout=3)
+            if w and w["proc"].is_alive():
+                w = None  # stale message from an evicted predecessor in this slot
             if w:
                 if w.get("unit"):
                     in_flight.discard(w["unit"])
@@ -222,10 +267,33 @@ def supervisor(cfg, parents_idx, max_workers):
         wid = free[0]
         tq = ctx.Queue()
         ev = ctx.Event()
-        p = ctx.Process(target=worker_main, args=(wid, cfg, req_q, resp[wid], tq, res_q, ev))
+        p = ctx.Process(target=safe_worker_main, args=(wid, cfg, srv_state['req_q'], srv_state['resp'][wid], tq, res_q, ev))
         p.start()
         workers[wid] = {"proc": p, "task_q": tq, "stop": ev, "unit": None, "parent": None, "t_spawn": time.time()}
         L("spawn worker", wid, "pid", p.pid)
+
+    def evict(wids):
+        """Free GPU 3 now: SIGUSR1 (safe exit), SIGKILL after 5 s. Returns True if SIGKILL was needed."""
+        for wid in wids:
+            workers[wid]["stop"].set()
+            try:
+                os.kill(workers[wid]["proc"].pid, signal.SIGUSR1)
+            except OSError:
+                pass
+        t0 = time.time()
+        while time.time() - t0 < 5 and any(workers[w]["proc"].is_alive() for w in wids):
+            time.sleep(0.1)
+        hard = False
+        for wid in wids:
+            if workers[wid]["proc"].is_alive():
+                workers[wid]["proc"].kill()
+                hard = True
+            workers[wid]["proc"].join(timeout=30)
+            if workers[wid].get("unit"):
+                in_flight.discard(workers[wid]["unit"])
+            workers.pop(wid)
+            L("evicted worker", wid, "hard" if hard else "safe")
+        return hard
 
     def on_term(*_):
         nonlocal stopping
@@ -240,6 +308,30 @@ def supervisor(cfg, parents_idx, max_workers):
             pass
         if os.path.exists(f"{root}/STOP"):
             stopping = True
+        for wid in list(workers):  # workers that died without saying so (crash, external kill)
+            if not workers[wid]["proc"].is_alive():
+                code = workers[wid]["proc"].exitcode
+                L("worker gone", wid, "exitcode", code)
+                if workers[wid].get("unit"):
+                    in_flight.discard(workers[wid]["unit"])
+                workers.pop(wid)
+                if code not in (0, 17):
+                    server_tainted = True  # crashed or killed: it may have died mid-request
+        if os.path.exists(f"{root}/EVICT_TEST") and workers:  # verification hook: exercise the eviction path
+            os.remove(f"{root}/EVICT_TEST")
+            wid = max(workers, key=lambda i: workers[i]["t_spawn"])
+            t_ev = time.time()
+            hard = evict([wid])
+            server_tainted |= hard
+            L("EVICT_TEST", wid, "hard" if hard else "safe", f"{time.time() - t_ev:.2f}s")
+        if server_tainted:
+            # drain everything and restart the server with fresh queues before spawning again
+            if workers:
+                evict(list(workers))
+            srv_state["proc"].kill()
+            srv_state["proc"].join(timeout=30)
+            start_server()
+            server_tainted = False
         pids = {w["proc"].pid for w in workers.values()}
         try:
             budget = GB.assess(pids, cpu_cap_workers=max_workers)
@@ -253,24 +345,12 @@ def supervisor(cfg, parents_idx, max_workers):
         stable_grant = min(grant_hist) if len(grant_hist) >= 6 else 0  # hysteresis: grant held for ~30 s
         if budget.get("over_cap") and n and budget.get("daemon", {}).get("active"):
             L("DAEMON ACTIVE -> kill all workers", json.dumps({k: budget.get(k) for k in ("total_ours_mib", "free_mib", "daemon_mib")}))
-            for wid in list(workers):
-                workers[wid]["stop"].set()
-                workers[wid]["proc"].kill()
-            for wid in list(workers):
-                workers[wid]["proc"].join(timeout=30)
-                if workers[wid].get("unit"):
-                    in_flight.discard(workers[wid]["unit"])
-                workers.pop(wid)
+            server_tainted |= evict(list(workers))
         elif budget.get("over_cap") and n:
             # hard limit: free GPU-3 memory immediately (youngest first); unit is lost and re-run on resume
             wid = max(workers, key=lambda i: workers[i]["t_spawn"])
             L("OVER CAP -> kill worker", wid, json.dumps({k: budget.get(k) for k in ("total_ours_mib", "free_mib", "daemon_mib")}))
-            workers[wid]["stop"].set()
-            workers[wid]["proc"].kill()
-            workers[wid]["proc"].join(timeout=30)
-            if workers[wid].get("unit"):
-                in_flight.discard(workers[wid]["unit"])
-            workers.pop(wid)
+            server_tainted |= evict([wid])
         elif stopping or budget.get("granted_workers", 0) < n:
             want = 0 if stopping else budget.get("granted_workers", 0)
             active = sorted((i for i in workers if not workers[i]["stop"].is_set()), key=lambda i: -workers[i]["t_spawn"])
@@ -294,8 +374,10 @@ def supervisor(cfg, parents_idx, max_workers):
             break
     st = scan(root, parents_idx)
     status_report(cfg, root, parents_idx, st, budget, 0, t_start, n_start, {"stopping": stopping, "finished": not pending_units()})
-    req_q.put(None)
-    srv.join(timeout=60)
+    srv_state["req_q"].put(None)
+    srv_state["proc"].join(timeout=60)
+    if srv_state["proc"].is_alive():
+        srv_state["proc"].kill()
     L("supervisor exit")
 
 
@@ -311,8 +393,8 @@ def main():
     a = ap.parse_args()
     assert a.pool in ("sel_dev_parents",) or os.environ.get("OV_ALLOW_TEST_PARENTS") == "1", \
         "test parents are not authorised yet"
-    # CPU cap (protocol Amendment 3): <= 18 cores = workers (1 thread each) + inference server (2) + supervisor (1)
-    CPU_CAP = 18
+    # CPU cap (protocol Amendment 4): <= 13 cores = workers (1 thread each) + inference server (2) + supervisor (1)
+    CPU_CAP = 13
     assert a.max_workers + 3 <= CPU_CAP, f"max_workers {a.max_workers} exceeds the {CPU_CAP}-core cap"
     n_pool = json.load(open(f"{STUDY}/roster/reset_banks_v1.json"))["tasks"][a.task]["pools"][a.pool]["n"]
     if a.parents:
