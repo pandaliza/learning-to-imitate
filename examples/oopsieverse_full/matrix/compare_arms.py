@@ -16,7 +16,7 @@ import numpy as np
 
 RUNS = "/edrive1/lizad/oopsieverse_full_study/runs/matrix_eval"
 STUDY = "/scr/lizad/personal/learning-to-imitate/outputs/oopsieverse_full_study"
-ARMS = ["amix", "asafe", "imean", "ipath", "ipathg", "auxpathg"]
+ARMS = ["amix", "asafe", "imean", "ipath", "ipathg", "auxpathg", "ssmix", "cmean"]
 NAMES = {"amix": "A-MIX", "asafe": "A-SAFE", "imean": "I-MEAN", "ipath": "I-PATH", "ipathg": "I-PATH-G",
          "auxpathg": "AUX-PATH-G", "ssmix": "safe-sized mix", "cmean": "canonical mean"}
 FAMILY = ["imean", "ipath", "ipathg"]
