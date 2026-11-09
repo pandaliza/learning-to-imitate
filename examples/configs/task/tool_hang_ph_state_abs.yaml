@@ -1,0 +1,9 @@
+# @package task
+# tool_hang state with absolute OSC actions (robomimic low_dim_abs.hdf5) and absolute control.
+# Open-loop replay of these demos under robosuite 1.5.1 succeeds 8/20 (40%).
+defaults:
+  - tool_hang_ph_state
+  - _self_
+
+dataset_filename: "robomimic/tool_hang/ph/low_dim_abs.hdf5"
+abs_control: true

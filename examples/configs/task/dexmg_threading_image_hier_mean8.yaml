@@ -1,0 +1,23 @@
+# @package task
+# Config B ("hierarchical") intent on DexMG Threading: a small MLP predictor maps the 2-step
+# proprio history to the intent (mean of both arms' eef pose over t+1..t+8, 14-d); the predicted
+# intent is appended to the obs as a synthetic low-dim key and the ChiUNet action flow (and its
+# image encoder) are trained with the action loss as in the baseline. Use with network=chiunet.
+defaults:
+  - dexmg_threading_image
+  - _self_
+
+intent_conditioning: true
+intent_dim: 14
+intent_type: mean
+intent_horizon: 8
+intent_keys: [robot0_eef_pos, robot0_eef_quat, robot1_eef_pos, robot1_eef_quat]
+intent_predictor: true
+intent_training_mode: joint
+
+shape_meta:
+  obs:
+    intent:
+      shape: [14]
+      type: low_dim
+      synthetic: true  # not an env obs key; injected at train/eval time

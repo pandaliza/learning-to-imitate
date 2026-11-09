@@ -1,0 +1,11 @@
+# @package task
+# Intent = 4 waypoint tokens: eef pose of both arms at t+2, t+4, t+6, t+8,
+# flattened to one 4 x 14 = 56-dim vector (FlowIntentAgent treats it as a single vector).
+defaults:
+  - dexmg_threading_image_flow_intent
+  - _self_
+
+intent_type: waypoints
+intent_waypoints: [2, 4, 6, 8]
+intent_horizon: 8
+intent_dim: 56

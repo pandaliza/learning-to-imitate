@@ -13,3 +13,5 @@ save_freq: 10000
 eval_episodes: 50
 eval_nsteps: 0
 save_video: True
+eval_reset_seed_base: null  # fixed-reset eval: round i env j resets with base + i * num_envs + j
+eval_results_path: null  # per-episode JSON lines (reset_seed, success, ...) appended here

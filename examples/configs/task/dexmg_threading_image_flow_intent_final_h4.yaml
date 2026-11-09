@@ -1,0 +1,8 @@
+# @package task
+# Intent = exact eef pose (both arms, 14-dim) at t+4 (endpoint, no averaging).
+defaults:
+  - dexmg_threading_image_flow_intent
+  - _self_
+
+intent_type: final
+intent_horizon: 4

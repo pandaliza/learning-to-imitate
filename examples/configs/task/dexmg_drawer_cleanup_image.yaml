@@ -1,0 +1,61 @@
+# @package task
+# DexMimicGen TwoArmDrawerCleanup (two Panda arms with dexterous hands), image observations.
+# Dataset: MimicGen/dexmimicgen_datasets generated/two_arm_drawer_cleanup.hdf5
+# Actions: 24-d = per arm 6-d delta OSC pose + 6-d hand joint targets (not in [-1,1]; min-max normalized).
+# Demos are 272-351 steps, so the episode limit is 500 (Threading uses 400).
+defaults:
+  - robomimic_base
+  - _self_
+
+env_name: "drawer_cleanup"
+obs_type: "image"
+env_type: "dexmg"
+
+dataset_path: /edrive4/ldahiya/dexmg_datasets/generated/two_arm_drawer_cleanup.hdf5
+
+abs_action: false
+max_episode_steps: 500
+# Rebuild the eval scene to match the dataset (dex-hand mount is rotated 120 deg and visual geoms
+# carry no mass in the installed robosuite/dexmimicgen). Without this every eval scores ~0%.
+match_dataset_scene: true
+render_obs_key: "agentview_image"
+
+horizon: 16
+act_dim: 24
+
+# lowdim keys are ordered so the per-arm eef pose (the intent) is one contiguous block.
+shape_meta:
+  action:
+    shape:
+      - 24
+  obs:
+    agentview_image:
+      shape: [3, 84, 84]
+      type: rgb
+    robot0_eye_in_hand_image:
+      shape: [3, 84, 84]
+      type: rgb
+    robot1_eye_in_hand_image:
+      shape: [3, 84, 84]
+      type: rgb
+    robot0_eef_pos:
+      shape: [3]
+      type: low_dim
+    robot0_eef_quat:
+      shape: [4]
+      type: low_dim
+    robot1_eef_pos:
+      shape: [3]
+      type: low_dim
+    robot1_eef_quat:
+      shape: [4]
+      type: low_dim
+    robot0_gripper_qpos:
+      shape: [12]
+      type: low_dim
+    robot1_gripper_qpos:
+      shape: [12]
+      type: low_dim
+
+num_envs: 4
+max_demos: null

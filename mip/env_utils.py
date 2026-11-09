@@ -155,8 +155,10 @@ class MultiStepWrapper:
     def reset(self, **kwargs):
         """Resets the environment using kwargs."""
         # Use stored seed if available (Gymnasium style), otherwise use provided seed
+        # (an explicitly passed seed wins, so fixed-reset evals are not overridden on the first reset)
         if hasattr(self, "_seed") and self._seed is not None:
-            kwargs["seed"] = self._seed
+            if kwargs.get("seed") is None:
+                kwargs["seed"] = self._seed
             self._seed = None  # Use seed only once
 
         # Filter out gymnasium-specific kwargs for old gym environments

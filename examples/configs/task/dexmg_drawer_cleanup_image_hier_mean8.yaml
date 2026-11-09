@@ -1,0 +1,21 @@
+# @package task
+# Config B intent (MLP predictor on proprio -> mean of both arms' eef pose over t+1..t+8, 14-d),
+# appended to the obs as a synthetic low-dim key. Use with network=chiunet.
+defaults:
+  - dexmg_drawer_cleanup_image
+  - _self_
+
+intent_conditioning: true
+intent_dim: 14
+intent_type: mean
+intent_horizon: 8
+intent_keys: [robot0_eef_pos, robot0_eef_quat, robot1_eef_pos, robot1_eef_quat]
+intent_predictor: true
+intent_training_mode: joint
+
+shape_meta:
+  obs:
+    intent:
+      shape: [14]
+      type: low_dim
+      synthetic: true

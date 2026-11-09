@@ -1,0 +1,18 @@
+# @package task
+# I-PATH on tool_hang ph state (delta_legacy actions, same obs as tool_hang_ph_state).
+# Intent = future EEF poses at t+2,4,6,8 in the current EEF frame (pos + 6D rot), 4 x 9 = 36-D,
+# MinMax-normalized to [-1, 1] (examples/oopsieverse_full/matrix/intent_targets.py "ipath").
+# The action policy is teacher-forced on the GT intent appended to obs; at eval the intent is sampled
+# by a rectified-flow predictor (16 Euler steps from N(0, I)) trained on the same target.
+defaults:
+  - tool_hang_ph_state
+  - _self_
+
+intent_conditioning: true
+intent_type: "path"
+intent_waypoints: [2, 4, 6, 8]
+intent_horizon: 8
+intent_dim: 36
+intent_predictor: true
+intent_predictor_type: "flow"
+intent_training_mode: "independent"

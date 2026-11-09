@@ -1,0 +1,60 @@
+# @package task
+# DexMimicGen TwoArmThreePieceAssembly (two Panda arms, parallel grippers), image observations.
+# Dataset: MimicGen/dexmimicgen_datasets generated/two_arm_three_piece_assembly.hdf5 (delta OSC actions, 14-dim).
+defaults:
+  - robomimic_base
+  - _self_
+
+env_name: "three_piece_assembly"
+obs_type: "image"
+env_type: "dexmg"
+
+# Local path (download with external/dexmimicgen_src/dexmimicgen/scripts/download_hf_dataset.py).
+# (no dataset_filename is set, so the HF download path in robomimic_base is not used.)
+dataset_path: /edrive4/ldahiya/dexmg_datasets/generated/two_arm_three_piece_assembly.hdf5
+
+abs_action: false  # dataset actions are delta OSC in [-1, 1]
+max_episode_steps: 300  # official DexMG eval horizon; demos are 227-272 steps
+render_obs_key: "agentview_image"
+
+horizon: 16
+act_dim: 14
+
+# lowdim keys are ordered so the per-arm eef pose (the intent) is one contiguous block.
+shape_meta:
+  action:
+    shape:
+      - 14
+  obs:
+    agentview_image:
+      shape: [3, 84, 84]
+      type: rgb
+    robot0_eye_in_hand_image:
+      shape: [3, 84, 84]
+      type: rgb
+    robot1_eye_in_hand_image:
+      shape: [3, 84, 84]
+      type: rgb
+    robot0_eef_pos:
+      shape: [3]
+      type: low_dim
+    robot0_eef_quat:
+      shape: [4]
+      type: low_dim
+    robot1_eef_pos:
+      shape: [3]
+      type: low_dim
+    robot1_eef_quat:
+      shape: [4]
+      type: low_dim
+    robot0_gripper_qpos:
+      shape: [2]
+      type: low_dim
+    robot1_gripper_qpos:
+      shape: [2]
+      type: low_dim
+
+num_envs: 4
+
+# Load only the first N demos (null = all 1006). Used by smoke tests; override with task.max_demos=N.
+max_demos: null

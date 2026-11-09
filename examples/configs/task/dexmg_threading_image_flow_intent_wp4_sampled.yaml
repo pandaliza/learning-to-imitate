@@ -1,0 +1,9 @@
+# @package task
+# Config A wp4 but the action flow is trained on intents sampled from the intent flow
+# (after a 20k-step GT warm-up) instead of ground-truth intents, closing the train/eval gap.
+defaults:
+  - dexmg_threading_image_flow_intent_wp4
+  - _self_
+
+decoder_uses_sampled_intent: true
+decoder_curriculum_steps: 20000

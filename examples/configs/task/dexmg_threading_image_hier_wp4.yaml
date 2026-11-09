@@ -1,0 +1,16 @@
+# @package task
+# Config B intent with 4 waypoint tokens (both arms' eef pose at t+2,4,6,8 -> 56-d).
+defaults:
+  - dexmg_threading_image_hier_mean8
+  - _self_
+
+intent_type: waypoints
+intent_waypoints: [2, 4, 6, 8]
+intent_dim: 56
+
+shape_meta:
+  obs:
+    intent:
+      shape: [56]
+      type: low_dim
+      synthetic: true

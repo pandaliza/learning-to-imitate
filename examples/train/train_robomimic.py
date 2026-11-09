@@ -4,6 +4,7 @@ Author: Chaoyi Pan
 Date: 2025-10-03
 """
 
+import json
 import os
 import time
 from contextlib import contextmanager
@@ -30,7 +31,7 @@ from mip.agent import TrainingAgent  # noqa: E402
 from mip.config import Config  # noqa: E402
 from mip.flow_intent_agent import FlowIntentAgent  # noqa: E402  [Config A]
 from mip.intent_encoder import IntentEncoder  # noqa: E402
-from mip.intent_predictor import IntentPredictor  # noqa: E402
+from mip.intent_predictor import IntentFlowPredictor, IntentPredictor  # noqa: E402
 from mip.dataset_utils import loop_dataloader  # noqa: E402
 from mip.datasets.robomimic_dataset import make_dataset  # noqa: E402
 from mip.envs.robomimic.robomimic_env import make_vec_env  # noqa: E402
@@ -350,6 +351,15 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
                         else:
                             intent = intent_gt_encoded.detach()  # GT (detached so action flow gets no encoder grad)
                             _joint_hl_loss = None
+                        # Sampled-intent conditioning: after decoder_curriculum_steps of GT warm-up, the
+                        # action policy trains on the predictor's samples, as it sees them at eval.
+                        if (getattr(config.task, "decoder_uses_sampled_intent", False)
+                                and isinstance(intent_predictor, IntentFlowPredictor)
+                                and n_gradient_step >= getattr(config.task, "decoder_curriculum_steps", 0)):
+                            with torch.no_grad():
+                                intent = intent_predictor(base_obs)
+                            if n_gradient_step == max(start_step, getattr(config.task, "decoder_curriculum_steps", 0)):
+                                loguru.logger.info(f"Action policy now trains on sampled intent (step {n_gradient_step})")
                         intent_expanded = intent.unsqueeze(1).expand(
                             -1, config.task.obs_steps, -1
                         )  # (B, obs_steps, intent_dim or intent_emb_dim)
@@ -417,13 +427,18 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
                         intent_gt_ind = intent_encoder(_raw_intent_ind).mean(dim=1)
                     else:
                         intent_gt_ind = _raw_intent_ind
-                    intent_pred = intent_predictor(base_obs)
-                    intent_pred_loss = torch.nn.functional.mse_loss(intent_pred, intent_gt_ind)
+                    if isinstance(intent_predictor, IntentFlowPredictor):
+                        intent_pred_loss = intent_predictor.flow_loss(base_obs, intent_gt_ind)
+                        _loss_key = "intent_flow_loss"
+                    else:
+                        intent_pred = intent_predictor(base_obs)
+                        intent_pred_loss = torch.nn.functional.mse_loss(intent_pred, intent_gt_ind)
+                        _loss_key = "intent_pred_mse"
                     intent_pred_optimizer.zero_grad()
                     intent_pred_loss.backward()
                     intent_pred_optimizer.step()
                     intent_pred_lr_scheduler.step()
-                    info["intent_pred_mse"] = intent_pred_loss.item()
+                    info[_loss_key] = intent_pred_loss.item()
 
             for k, v in info.items():
                 if isinstance(v, torch.Tensor):
@@ -518,8 +533,18 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None,
                     loguru.logger.info(
                         f"New best model! {primary_metric_key} = {success_rate:.4f}"
                     )
-                    # Save to local models directory
-                    logger.save_agent(agent=agent, identifier="best")
+                    # Save to local models directory (with the intent predictor, so model_best.pt alone
+                    # is enough to evaluate an intent arm)
+                    logger.save_agent(agent=agent, identifier="best", training_state={
+                        "n_gradient_step": n_gradient_step,
+                        "best_metrics": best_metrics,
+                        "intent_predictor_state": (
+                            intent_predictor.state_dict() if intent_predictor is not None else None
+                        ),
+                        "intent_encoder_state": (
+                            intent_encoder.state_dict() if intent_encoder is not None else None
+                        ),
+                    })
 
                     # Save to global checkpoints directory with success rate comparison
                     # Include training state for resuming
@@ -774,9 +799,16 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1,
 
     arch_variant = getattr(config.network, "arch_variant", "flow_action")
 
+    _reset_base = getattr(config.log, "eval_reset_seed_base", None)
+    _episode_records = []
     for i in range(config.log.eval_episodes // config.task.num_envs):
         ep_reward = [0.0] * config.task.num_envs
-        obs, _ = envs.reset()
+        if _reset_base is not None:
+            _reset_seeds = [int(_reset_base) + i * config.task.num_envs + j for j in range(config.task.num_envs)]
+            obs, _ = envs.reset(seed=_reset_seeds)
+        else:
+            _reset_seeds = [None] * config.task.num_envs
+            obs, _ = envs.reset()
         t = 0
         _ep_eef = []   # collect eef_pos for env 0 this episode
 
@@ -1016,7 +1048,21 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1,
         episode_rewards.append(ep_reward)
         episode_steps.append(t)
         episode_success.append(success)
+        _episode_records += [
+            {"reset_seed": _reset_seeds[j], "success": float(success[j]), "reward": float(ep_reward[j])}
+            for j in range(config.task.num_envs)
+        ]
         episode_kit_success.append(kit_success)
+        # Per-round progress so a slow or stalled eval is visible in the log.
+        loguru.logger.info(
+            f"eval round {i + 1}/{config.log.eval_episodes // config.task.num_envs} done, "
+            f"running success {np.nanmean(episode_success):.3f}"
+        )
+    if getattr(config.log, "eval_results_path", None):
+        with open(config.log.eval_results_path, "a") as _f:
+            for _r in _episode_records:
+                _f.write(json.dumps({**_r, "num_steps": int(num_steps), "rollout_seed": config.optimization.seed,
+                                     "model_path": config.optimization.model_path}) + "\n")
     # Log performance metrics
     loguru.logger.info(
         f"Nstep: {num_steps} Mean step: {np.nanmean(episode_steps)} "
@@ -1216,11 +1262,21 @@ def main(config):
             if _intent_type_inst == "encoded_mean"
             else config.task.intent_dim
         )
-        intent_predictor = IntentPredictor(
-            obs_steps=config.task.obs_steps,
-            base_obs_dim=_base_obs_dim,
-            intent_dim=_pred_out_dim,
-        ).to(config.optimization.device)
+        if getattr(config.task, "intent_predictor_type", "mlp") == "flow":
+            assert getattr(config.task, "intent_training_mode", "independent") == "independent", (
+                "intent_predictor_type=flow supports intent_training_mode=independent only")
+            intent_predictor = IntentFlowPredictor(
+                obs_steps=config.task.obs_steps,
+                base_obs_dim=_base_obs_dim,
+                intent_dim=_pred_out_dim,
+                seed=config.optimization.seed,
+            ).to(config.optimization.device)
+        else:
+            intent_predictor = IntentPredictor(
+                obs_steps=config.task.obs_steps,
+                base_obs_dim=_base_obs_dim,
+                intent_dim=_pred_out_dim,
+            ).to(config.optimization.device)
         n_params = sum(p.numel() for p in intent_predictor.parameters())
         loguru.logger.info(
             f"IntentPredictor: {n_params/1e3:.1f}K params "

@@ -1,0 +1,10 @@
+# @package task
+# I-PATH with sampled-intent training: identical to tool_hang_ph_state_ipath, except that after a
+# 20k-step GT warm-up the action policy is conditioned on the flow predictor's sampled path (no grad)
+# instead of the ground-truth path, matching what it receives at eval.
+defaults:
+  - tool_hang_ph_state_ipath
+  - _self_
+
+decoder_uses_sampled_intent: true
+decoder_curriculum_steps: 20000

@@ -14,6 +14,11 @@ class LogConfig:
     eval_episodes: int = 10
     eval_nsteps: int = 0  # 0 = use default list from loss_type; otherwise single value
     save_video: bool = False
+    # Fixed-reset evaluation: when set, eval round i resets env j with seed
+    # eval_reset_seed_base + i * num_envs + j (one shared reset pool across policies), and per-episode
+    # outcomes are appended as JSON lines to eval_results_path.
+    eval_reset_seed_base: int | None = None
+    eval_results_path: str | None = None
 
 
 @dataclass
@@ -97,6 +102,15 @@ class TaskConfig:
     obs_type: str = "state"
     env_type: str = "ph"
     abs_action: bool = True
+    # Drive the env's OSC controller with absolute targets. Only set this for datasets whose
+    # actions really are absolute (e.g. robomimic *_abs.hdf5). robosuite 1.5 ignores the legacy
+    # `control_delta` flag, so the default robomimic tasks (delta low_dim.hdf5 / image.hdf5 with
+    # abs_action=true) have always run delta control; keep them that way.
+    abs_control: bool = False
+    # DexMimicGen only: rebuild the eval scene to match the dataset's recorded scenes (hand-mount
+    # orientation and mass computation differ in the installed robosuite/dexmimicgen; see
+    # mip/envs/robomimic/robomimic_env.py:match_dataset_scene). Without it Drawer Cleanup evals at 0%.
+    match_dataset_scene: bool = False
     # Dataset configuration - either HuggingFace or local path
     dataset_repo: str | None = (
         None  # HuggingFace repository ID (e.g., "ChaoyiPan/mip-dataset")
@@ -130,6 +144,7 @@ class TaskConfig:
     shape_meta: dict = field(default_factory=dict)
     render_obs_key: str = "agentview_image"
     val_dataset_percentage: float = 0.0
+    max_demos: int | None = None  # load only the first N demos (smoke tests / data-scaling)
     # Image observation settings
     rgb_model: str = "resnet18"
     resize_shape: list[int] | None = None
@@ -151,11 +166,14 @@ class TaskConfig:
     intent_conditioning: bool = False  # Whether to add intent (future eef pose) as extra conditioning
     intent_dim: int = 7  # Dimension of intent vector (3 pos + 4 quat = 7)
     intent_predictor: bool = False  # Use a learned MLP to predict intent at inference (vs. CV proxy)
+    intent_predictor_type: str = "mlp"  # "mlp": deterministic MSE predictor; "flow": rectified-flow sampler (I-PATH)
     intent_horizon: int = 8  # High-level lookahead N: intent = mean(eef[t+1..t+N]). Independent of act_steps.
     intent_training_mode: str = "independent"  # "independent": flow policy trains on GT intent;
     # "joint": flow policy trains on HL predictor output (detached) — closes train/inference gap.
     intent_type: str = "mean"  # "mean": mean(eef[t+1..t+N]); "final": eef[t+N] (endpoint only);
     # "encoded_mean": per-step MLP encoding then mean-pool → intent_emb_dim-D vector
+    # "waypoints": poses at offsets intent_waypoints (e.g. t+2,4,6,8), flattened; intent_dim = W * D
+    intent_waypoints: list[int] | None = None  # future offsets for intent_type="waypoints"
     intent_emb_dim: int = 64  # output dim of IntentEncoder (only used when intent_type=="encoded_mean")
     intent_encoder_warmup_steps: int = 0  # freeze IntentEncoder after this many steps (0 = never freeze)
     intent_keys: list[str] = field(

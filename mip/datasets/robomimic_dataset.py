@@ -30,6 +30,14 @@ from mip.datasets.imagecodecs import register_codecs
 register_codecs()
 
 
+# Robomimic tasks plus DexMimicGen tasks (robomimic-format HDF5s, bimanual).
+ROBOMIMIC_ENV_NAMES = [
+    "can", "lift", "square", "tool_hang", "transport",
+    "threading", "three_piece_assembly", "box_cleanup", "drawer_cleanup",
+    "lift_tray", "coffee", "pouring", "can_sort",
+]
+
+
 def make_dataset(task_config, mode="train"):
     if task_config.env_name in ("pick_egg", "wipe_countertop"):
         from mip.datasets.oopsieverse_dataset import make_dataset as make_oopsieverse_dataset
@@ -67,7 +75,7 @@ def make_dataset(task_config, mode="train"):
     if task_config.env_name == "pusht":
         from mip.datasets.pusht_dataset import make_dataset as make_pusht_dataset
         return make_pusht_dataset(task_config, mode=mode)
-    elif task_config.env_name in ["can", "lift", "square", "tool_hang", "transport"]:
+    elif task_config.env_name in ROBOMIMIC_ENV_NAMES:
         if task_config.obs_type == "state":
             # pad_after must cover the longer of act_steps and intent_horizon so that
             # near-episode-end samples always have enough future steps for both action
@@ -97,6 +105,7 @@ def make_dataset(task_config, mode="train"):
                 intent_keys=intent_keys,
                 intent_sub_slice=intent_sub_slice,
                 intent_key_groups=intent_key_groups,
+                intent_waypoints=getattr(task_config, "intent_waypoints", None),
             )
         elif task_config.obs_type == "image":
             load_sim_states = getattr(task_config, "load_sim_states", False)
@@ -125,6 +134,9 @@ def make_dataset(task_config, mode="train"):
                 slot_image_key=getattr(task_config, "slot_image_key", "agentview_image"),
                 slot_obj_state_dim=getattr(task_config, "slot_obj_state_dim", 10),
                 slot_obj_state_key=getattr(task_config, "slot_obj_state_key", "object"),
+                intent_keys=getattr(task_config, "intent_keys", None),
+                intent_waypoints=getattr(task_config, "intent_waypoints", None),
+                max_demos=getattr(task_config, "max_demos", None),
             )
         else:
             raise ValueError(f"Invalid observation type: {task_config.obs_type}")
@@ -153,11 +165,13 @@ class RobomimicDataset(BaseDataset):
         intent_keys: list[str] | None = None,  # obs keys to use for intent; defaults to eef pos+quat
         intent_sub_slice: list[int] | None = None,  # [start, end] relative to intent_keys range
         intent_key_groups: list[dict] | None = None,  # multi-group intent; overrides intent_keys+sub_slice
+        intent_waypoints: list[int] | None = None,  # intent_type="path": future offsets, default (2, 4, 6, 8)
     ):
         super().__init__()
         self.rotation_transformer = RotationTransformer(
             from_rep="axis_angle", to_rep=rotation_rep
         )
+        self.intent_waypoints = list(intent_waypoints) if intent_waypoints else [2, 4, 6, 8]
         self.val_dataset_percentage = val_dataset_percentage
         self.mode = mode
         self.intent_conditioning = intent_conditioning
@@ -315,6 +329,26 @@ class RobomimicDataset(BaseDataset):
                 self.intent_start = self.intent_start + sub_start
             self.intent_slices = [(self.intent_start, self.intent_end)]
 
+        if intent_conditioning and intent_type == "path":
+            # I-PATH: per-dim MinMax to [-1, 1] over the targets of every train frame.
+            assert max(self.intent_waypoints) <= self.intent_horizon, "intent_horizon must cover intent_waypoints"
+            self._eef_pos_slice = slice(key_offsets["robot0_eef_pos"], key_offsets["robot0_eef_pos"] + 3)
+            self._eef_quat_slice = slice(key_offsets["robot0_eef_quat"], key_offsets["robot0_eef_quat"] + 4)
+            all_obs = self.replay_buffer["obs"][:]
+            ends = self.replay_buffer.episode_ends[:]
+            targets, start = [], 0
+            for end in ends:
+                ep = all_obs[start:end]
+                targets.append(eef_path_target(ep[:, self._eef_pos_slice], ep[:, self._eef_quat_slice],
+                                               np.arange(len(ep)), self.intent_waypoints))
+                start = end
+            targets = np.concatenate(targets)
+            self.intent_normalizer = MinMaxNormalizer(targets)
+            # Per-frame lookup (episode-end clamping == the sampler's edge padding), so __getitem__ does
+            # no rotation math.
+            self._path_targets = self.intent_normalizer.normalize(targets)
+            logger.info(f"I-PATH intent: offsets {self.intent_waypoints}, dim {targets[0].shape[-1]}")
+
         if intent_conditioning:
             if self.intent_start is None or self.intent_end is None:
                 raise ValueError(
@@ -373,7 +407,9 @@ class RobomimicDataset(BaseDataset):
         }
 
         if self.intent_conditioning:
-            if self.intent_type == "cv_proxy":
+            if self.intent_type == "path":
+                intent = self._path_targets[sample["_cur_frame"]]
+            elif self.intent_type == "cv_proxy":
                 # Constant-velocity proxy: same formula used at eval — no GT lookahead.
                 # eef_now/prev come from the obs history (already normalized).
                 eef_now  = state[self.obs_steps - 1, self.intent_start:self.intent_end]
@@ -405,9 +441,32 @@ class RobomimicDataset(BaseDataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         sample = self.sampler.sample_sequence(idx)
+        if self.intent_conditioning and self.intent_type == "path":
+            buffer_start, _, sample_start, _ = self.sampler.indices[idx]
+            sample["_cur_frame"] = buffer_start + (self.obs_steps - 1) - sample_start
         data = self.sample_to_data(sample)
         torch_data = dict_apply(data, torch.tensor)
         return torch_data
+
+
+def eef_path_target(pos, quat, cur, ks):
+    """I-PATH target (examples/oopsieverse_full/matrix/intent_targets.py): future EEF poses at offsets ks,
+    each relative to the CURRENT EEF frame: p = R_t^T (x_{t+k} - x_t), R = R_t^T R_{t+k} -> 6D (first two
+    columns). pos (T, 3), quat (T, 4) xyzw (robosuite); cur: int or (N,) current indices; future indices are
+    clamped to the last frame (the sampler pads by repeating it). Returns (N, len(ks) * 9) float32."""
+    from scipy.spatial.transform import Rotation
+
+    cur = np.atleast_1d(np.asarray(cur))
+    T = len(pos)
+    R_all = Rotation.from_quat(quat).as_matrix()  # (T, 3, 3)
+    R_t = R_all[cur]
+    out = []
+    for k in ks:
+        f = np.minimum(cur + k, T - 1)
+        p = np.einsum("nji,nj->ni", R_t, pos[f] - pos[cur])
+        R = np.einsum("nji,njk->nik", R_t, R_all[f])
+        out.append(np.concatenate([p, R[:, :, 0], R[:, :, 1]], axis=-1))
+    return np.concatenate(out, axis=-1).astype(np.float32)
 
 
 def _data_to_obs(raw_obs, raw_actions, obs_keys, abs_action, rotation_transformer):
@@ -455,6 +514,9 @@ class RobomimicImageDataset(BaseDataset):
         slot_image_key: str = "agentview_image",
         slot_obj_state_dim: int = 10,
         slot_obj_state_key: str = "object",
+        intent_keys: list[str] | None = None,  # lowdim keys forming the intent; defaults to robot0 eef pos+quat
+        intent_waypoints: list[int] | None = None,  # for intent_type="waypoints": future offsets, e.g. [2,4,6,8]
+        max_demos: int | None = None,  # load only the first N demos (smoke tests)
     ):
         super().__init__()
         self.rotation_transformer = RotationTransformer(
@@ -463,6 +525,13 @@ class RobomimicImageDataset(BaseDataset):
         self.val_dataset_percentage = val_dataset_percentage
         self.mode = mode
         self.load_sim_states = load_sim_states
+        self.intent_keys = list(intent_keys) if intent_keys else ["robot0_eef_pos", "robot0_eef_quat"]
+        self.intent_waypoints = list(intent_waypoints) if intent_waypoints else None
+        if intent_type == "waypoints":
+            assert self.intent_waypoints, "intent_type='waypoints' requires intent_waypoints, e.g. [2, 4, 6, 8]"
+            assert max(self.intent_waypoints) <= (intent_horizon or act_steps), (
+                "intent_horizon must cover the largest waypoint offset"
+            )
 
         # Strip synthetic keys (e.g. "intent") from shape_meta before loading from HDF5.
         # These keys don't exist in the file and are injected at training/eval time.
@@ -494,6 +563,7 @@ class RobomimicImageDataset(BaseDataset):
             val_dataset_percentage=val_dataset_percentage,
             mode=mode,
             load_sim_states=load_sim_states,
+            max_demos=max_demos,
         )
 
         rgb_keys = []
@@ -520,7 +590,7 @@ class RobomimicImageDataset(BaseDataset):
             # __getitem__ can access full-horizon future frames for intent extraction.
             _full_horizon_keys: set[str] = set()
             if intent_conditioning:
-                _full_horizon_keys.update({"robot0_eef_pos", "robot0_eef_quat"})
+                _full_horizon_keys.update(self.intent_keys)
             if intent_type in ("slot", "cnn_image"):
                 # Both slot and cnn_image need future image frames for intent extraction.
                 _full_horizon_keys.add(slot_image_key)
@@ -560,20 +630,23 @@ class RobomimicImageDataset(BaseDataset):
             # Compute eef indices in the concatenated lowdim vector (for eval CV proxy).
             # Uses self.lowdim_keys (HDF5 keys only, in shape_meta order).
             offset = 0
+            key_range = {}
             for k in self.lowdim_keys:
                 dim = obs_shape_meta[k]["shape"][0]
-                if k == "robot0_eef_pos":
-                    self.intent_start = offset
-                if k == "robot0_eef_quat":
-                    self.intent_end = offset + dim
+                key_range[k] = (offset, offset + dim)
                 offset += dim
-            assert self.intent_start is not None and self.intent_end is not None, (
-                "intent_conditioning=True requires 'robot0_eef_pos' and 'robot0_eef_quat' "
-                "in shape_meta['obs'] as low_dim keys"
+            missing = [k for k in self.intent_keys if k not in key_range]
+            assert not missing, (
+                f"intent_conditioning=True requires intent_keys {missing} in shape_meta['obs'] as low_dim keys"
             )
+            ranges = [key_range[k] for k in self.intent_keys]
+            assert all(a[1] == b[0] for a, b in zip(ranges, ranges[1:], strict=False)), (
+                f"intent_keys {self.intent_keys} must be contiguous and in order in shape_meta['obs']"
+            )
+            self.intent_start, self.intent_end = ranges[0][0], ranges[-1][1]
             logger.info(
                 f"Intent conditioning enabled (image): eef lowdim indices "
-                f"[{self.intent_start}:{self.intent_end}] (dim=7), "
+                f"[{self.intent_start}:{self.intent_end}] (dim={self.intent_end - self.intent_start}), "
                 f"intent_horizon={self.intent_horizon}, intent_type={self.intent_type}"
             )
 
@@ -610,8 +683,9 @@ class RobomimicImageDataset(BaseDataset):
 
         # Save raw eef arrays before the delete loop below consumes them.
         # Needed for future-frame intent extraction when intent_conditioning=True.
-        _raw_eef_pos_full = sample["robot0_eef_pos"].copy() if self.intent_conditioning else None
-        _raw_eef_quat_full = sample["robot0_eef_quat"].copy() if self.intent_conditioning else None
+        _raw_intent_full = (
+            {k: sample[k].copy() for k in self.intent_keys} if self.intent_conditioning else None
+        )
         # Save raw slot/cnn_image data (full horizon) before deletion.
         _raw_slot_images_full = (
             sample[self.slot_image_key].copy() if self.intent_type in ("slot", "cnn_image") else None
@@ -685,16 +759,24 @@ class RobomimicImageDataset(BaseDataset):
                     torch_data["object_states"] = torch.tensor(slot_objs)    # (k, obj_state_dim)
             elif self.intent_type == "cv_proxy":
                 # Constant-velocity proxy from obs history — no GT lookahead needed.
-                pos_now  = _raw_eef_pos_full[self.obs_steps_int - 1].astype(np.float32)
-                pos_prev = _raw_eef_pos_full[self.obs_steps_int - 2].astype(np.float32)
-                quat_now  = _raw_eef_quat_full[self.obs_steps_int - 1].astype(np.float32)
-                quat_prev = _raw_eef_quat_full[self.obs_steps_int - 2].astype(np.float32)
-                pos_now  = self.normalizer["obs"]["robot0_eef_pos"].normalize(pos_now[None])[0]
-                pos_prev = self.normalizer["obs"]["robot0_eef_pos"].normalize(pos_prev[None])[0]
-                quat_now  = self.normalizer["obs"]["robot0_eef_quat"].normalize(quat_now[None])[0]
-                quat_prev = self.normalizer["obs"]["robot0_eef_quat"].normalize(quat_prev[None])[0]
-                eef_now  = np.concatenate([pos_now,  quat_now],  axis=-1)  # (7,)
-                eef_prev = np.concatenate([pos_prev, quat_prev], axis=-1)  # (7,)
+                eef_now = np.concatenate(
+                    [
+                        self.normalizer["obs"][k].normalize(
+                            _raw_intent_full[k][self.obs_steps_int - 1].astype(np.float32)[None]
+                        )[0]
+                        for k in self.intent_keys
+                    ],
+                    axis=-1,
+                )  # (intent_dim,)
+                eef_prev = np.concatenate(
+                    [
+                        self.normalizer["obs"][k].normalize(
+                            _raw_intent_full[k][self.obs_steps_int - 2].astype(np.float32)[None]
+                        )[0]
+                        for k in self.intent_keys
+                    ],
+                    axis=-1,
+                )
                 velocity = eef_now - eef_prev
                 half_h = (self.intent_horizon + 1) / 2.0
                 intent = (eef_now + half_h * velocity).astype(np.float32)
@@ -702,13 +784,20 @@ class RobomimicImageDataset(BaseDataset):
             else:
                 future_start = self.obs_steps_int
                 future_end = self.obs_steps_int + self.intent_horizon
-                eef_pos = _raw_eef_pos_full[future_start:future_end].astype(np.float32)
-                eef_quat = _raw_eef_quat_full[future_start:future_end].astype(np.float32)
-                eef_pos = self.normalizer["obs"]["robot0_eef_pos"].normalize(eef_pos)
-                eef_quat = self.normalizer["obs"]["robot0_eef_quat"].normalize(eef_quat)
-                future_eef = np.concatenate([eef_pos, eef_quat], axis=-1)  # (N, 7)
+                future_eef = np.concatenate(
+                    [
+                        self.normalizer["obs"][k].normalize(
+                            _raw_intent_full[k][future_start:future_end].astype(np.float32)
+                        )
+                        for k in self.intent_keys
+                    ],
+                    axis=-1,
+                )  # (N, intent_dim)
                 if self.intent_type == "final":
                     intent = future_eef[-1].astype(np.float32)
+                elif self.intent_type == "waypoints":
+                    # future_eef[k] is the pose at t+1+k; offset w -> index w-1. Flattened (W * D,).
+                    intent = future_eef[[w - 1 for w in self.intent_waypoints]].reshape(-1).astype(np.float32)
                 else:  # "mean"
                     intent = future_eef.mean(axis=0).astype(np.float32)
                 torch_data["intent"] = torch.tensor(intent)
@@ -767,6 +856,7 @@ def _convert_robomimic_to_replay(
     val_dataset_percentage=0.0,
     mode="train",
     load_sim_states: bool = False,
+    max_demos: int | None = None,
 ):
     """Convert Robomimic dataset to ReplayBuffer.
 
@@ -897,6 +987,8 @@ def _convert_robomimic_to_replay(
 
         episode_ends = []
         prev_end = 0
+        if max_demos is not None:
+            demo_indices = demo_indices[:max_demos]
         for i in demo_indices:
             demo = demos[f"demo_{i}"]
             episode_length = demo["actions"].shape[0]
@@ -959,14 +1051,16 @@ def _convert_robomimic_to_replay(
             )
             logger.info(f"Loaded sim states: shape={sim_state_data.shape}")
 
-        def img_copy(zarr_arr, zarr_idx, hdf5_arr, hdf5_idx):
+        def img_copy(zarr_arr, zarr_slice, hdf5_arr):
+            # Copies one whole demo per task (a single hdf5 read; per-frame reads are
+            # serialized by h5py and dominate load time). Returns #frames copied, 0 on failure.
             try:
-                zarr_arr[zarr_idx] = hdf5_arr[hdf5_idx]
+                zarr_arr[zarr_slice] = hdf5_arr[:]
                 # make sure we can successfully decode
-                _ = zarr_arr[zarr_idx]
-                return True
+                _ = zarr_arr[zarr_slice]
+                return zarr_slice.stop - zarr_slice.start
             except Exception:
-                return False
+                return 0
 
         with tqdm(
             total=n_steps * len(rgb_keys),
@@ -993,29 +1087,31 @@ def _convert_robomimic_to_replay(
                     for demo_list_idx, episode_idx in enumerate(demo_indices):
                         demo = demos[f"demo_{episode_idx}"]
                         hdf5_arr = demo["obs"][key]
-                        for hdf5_idx in range(hdf5_arr.shape[0]):
-                            if len(futures) >= max_inflight_tasks:
-                                # limit number of inflight tasks
-                                completed, futures = concurrent.futures.wait(
-                                    futures,
-                                    return_when=concurrent.futures.FIRST_COMPLETED,
-                                )
-                                for f in completed:
-                                    if not f.result():
-                                        raise RuntimeError("Failed to encode image!")
-                                pbar.update(len(completed))
-
-                            zarr_idx = episode_starts[demo_list_idx] + hdf5_idx
-                            futures.add(
-                                executor.submit(
-                                    img_copy, img_arr, zarr_idx, hdf5_arr, hdf5_idx
-                                )
+                        if len(futures) >= max_inflight_tasks:
+                            # limit number of inflight tasks
+                            completed, futures = concurrent.futures.wait(
+                                futures,
+                                return_when=concurrent.futures.FIRST_COMPLETED,
                             )
+                            for f in completed:
+                                if not f.result():
+                                    raise RuntimeError("Failed to encode image!")
+                                pbar.update(f.result())
+
+                        start = episode_starts[demo_list_idx]
+                        futures.add(
+                            executor.submit(
+                                img_copy,
+                                img_arr,
+                                slice(start, start + hdf5_arr.shape[0]),
+                                hdf5_arr,
+                            )
+                        )
                 completed, futures = concurrent.futures.wait(futures)
                 for f in completed:
                     if not f.result():
                         raise RuntimeError("Failed to encode image!")
-                pbar.update(len(completed))
+                    pbar.update(f.result())
 
     replay_buffer = ReplayBuffer(root)
     return replay_buffer
